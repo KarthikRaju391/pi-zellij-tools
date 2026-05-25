@@ -1,0 +1,16 @@
+{
+  "name": "pi-zellij-tools",
+  "version": "0.1.0",
+  "description": "Pi package with Zellij background task tools, task-state widget, completion events, and Zellij skill instructions.",
+  "keywords": ["pi-package", "pi", "zellij", "coding-agent"],
+  "license": "MIT",
+  "author": "KarthikRaju391",
+  "type": "module",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
