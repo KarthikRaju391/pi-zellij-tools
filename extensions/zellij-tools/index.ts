@@ -30,6 +30,8 @@ type ZellijTask = {
   last_exit_code?: number | null;
   notify_agent_on_exit?: boolean;
   trigger_agent_on_exit?: boolean;
+  caller_session_file?: string;
+  caller_session_id?: string;
   event_emitted_at?: number;
 };
 
@@ -238,7 +240,13 @@ function updateWidget(ctx: any, expanded = false) {
   }));
 }
 
-async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent, file?: string) {
+async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent, file?: string): Promise<boolean> {
+  const existing = readState().tasks.find((t) => t.id === event.task_id);
+  const currentSessionFile = ctx?.sessionManager?.getSessionFile?.();
+  const currentSessionId = ctx?.sessionManager?.getSessionId?.();
+  if (existing?.caller_session_file && currentSessionFile && existing.caller_session_file !== currentSessionFile) return false;
+  if (!existing?.caller_session_file && existing?.caller_session_id && currentSessionId && existing.caller_session_id !== currentSessionId) return false;
+
   const status: TaskStatus = event.exit_code === 0 ? "exited" : "failed";
   const task = updateTaskById(event.task_id, {
     status,
@@ -246,7 +254,7 @@ async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent,
     event_emitted_at: Date.now(),
   });
   updateWidget(ctx);
-  if (!task) return;
+  if (!task) return false;
 
   const text = `Background Zellij task "${task.name}" ${status} with exit code ${event.exit_code}. Pane: ${task.session || "current"}:${task.pane_id}. Inspect with zellij_snapshot if needed.`;
   if (ctx?.hasUI) ctx.ui.notify(text, event.exit_code === 0 ? "info" : "error");
@@ -261,6 +269,7 @@ async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent,
       triggerTurn: task.trigger_agent_on_exit !== false,
     });
   }
+  return true;
 }
 
 function startEventWatcher(pi: ExtensionAPI, ctx: any): fs.FSWatcher | undefined {
@@ -275,8 +284,9 @@ function startEventWatcher(pi: ExtensionAPI, ctx: any): fs.FSWatcher | undefined
         if (seen.has(file)) return;
         const event = JSON.parse(fs.readFileSync(file, "utf8")) as ZellijEvent;
         seen.add(file);
-        await handleZellijEvent(pi, ctx, event, file);
-        fs.renameSync(file, `${file}.processed`);
+        const handled = await handleZellijEvent(pi, ctx, event, file);
+        if (handled) fs.renameSync(file, `${file}.processed`);
+        else seen.delete(file);
       } catch {
         // File may still be being written, or may have been removed. Next fs event/manual refresh can retry.
       }
@@ -388,7 +398,7 @@ export default function (pi: ExtensionAPI) {
       }
       // The wrapped command is intentionally verbose; rename the visible pane back to the task name.
       await exec(pi, [...sessionArgs(session), "action", "rename-pane", "--pane-id", paneId, name], 10_000).catch(() => undefined);
-      const task = upsertTask({ id: taskId, session, pane_id: paneId, name, cwd, command: params.command, status: "running", notify_agent_on_exit: notifyAgentOnExit, trigger_agent_on_exit: triggerAgentOnExit });
+      const task = upsertTask({ id: taskId, session, pane_id: paneId, name, cwd, command: params.command, status: "running", notify_agent_on_exit: notifyAgentOnExit, trigger_agent_on_exit: triggerAgentOnExit, caller_session_file: ctx.sessionManager?.getSessionFile?.(), caller_session_id: ctx.sessionManager?.getSessionId?.() });
       refreshWidget(ctx);
       const subscribeCommand = makeSubscribeCommand(session, paneId);
       return {
