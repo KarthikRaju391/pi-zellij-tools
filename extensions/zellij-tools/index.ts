@@ -37,9 +37,10 @@ type ZellijTask = {
 
 type ZellijEvent = {
   task_id: string;
-  status: "exited" | "failed";
-  exit_code: number;
+  status: "exited" | "ready" | "failed" | "unknown";
+  exit_code?: number;
   completed_at: number;
+  message?: string;
 };
 type ZellijState = { version: 1; tasks: ZellijTask[] };
 
@@ -92,6 +93,7 @@ const WaitParams = {
     pattern: S.string("Regex pattern to wait for in pane output"),
     timeout_seconds: S.number("Max seconds to wait. Default 60"),
     fail_pattern: S.string("Optional regex that fails early if seen"),
+    blocking: S.boolean("Block until the pattern is seen. Default false; non-blocking writes a zellij-task-event when done"),
   },
   required: ["pane_id", "pattern"],
   additionalProperties: false,
@@ -266,14 +268,14 @@ async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent,
   if (existing?.caller_session_id) return currentSessionId === existing.caller_session_id ? await emitOwnedZellijEvent(pi, ctx, event, file) : false;
 
   // Legacy/unowned task: update shared state but do not inject into any Pi session.
-  const status: TaskStatus = event.exit_code === 0 ? "exited" : "failed";
+  const status: TaskStatus = event.status || (event.exit_code === 0 ? "exited" : "failed");
   updateTaskById(event.task_id, { status, last_exit_code: event.exit_code, event_emitted_at: Date.now() });
   updateWidget(ctx);
   return true;
 }
 
 async function emitOwnedZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent, file?: string): Promise<boolean> {
-  const status: TaskStatus = event.exit_code === 0 ? "exited" : "failed";
+  const status: TaskStatus = event.status || (event.exit_code === 0 ? "exited" : "failed");
   const task = updateTaskById(event.task_id, {
     status,
     last_exit_code: event.exit_code,
@@ -282,7 +284,9 @@ async function emitOwnedZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEve
   updateWidget(ctx);
   if (!task) return false;
 
-  const text = `Background Zellij task "${task.name}" ${status} with exit code ${event.exit_code}. Pane: ${task.session || "current"}:${task.pane_id}. Inspect with zellij_snapshot if needed.`;
+  const text = event.message || (status === "ready"
+    ? `Background Zellij task "${task.name}" matched wait condition. Pane: ${task.session || "current"}:${task.pane_id}.`
+    : `Background Zellij task "${task.name}" ${status} with exit code ${event.exit_code ?? "unknown"}. Pane: ${task.session || "current"}:${task.pane_id}. Inspect with zellij_snapshot if needed.`);
   if (ctx?.hasUI) ctx.ui.notify(text, event.exit_code === 0 ? "info" : "error");
   if (task.notify_agent_on_exit !== false) {
     pi.sendMessage({
@@ -463,29 +467,42 @@ export default function (pi: ExtensionAPI) {
       const timeout = params.timeout_seconds ?? 60;
       const cmd = `zellij ${params.session ? `--session ${q(params.session)} ` : ""}subscribe --pane-id ${q(params.pane_id)} --format raw --scrollback ${DEFAULT_SCROLLBACK}`;
       const failCheck = params.fail_pattern
-        ? `if grep -Eiq -- ${q(params.fail_pattern)} "$out"; then status=2; break; fi`
+        ? `if grep -Eiq -- ${q(params.fail_pattern)} "$out"; then status=failed; code=2; msg="Fail pattern matched"; break; fi`
         : "";
+      const iterations = Math.max(1, Math.ceil(timeout * 2));
+      const task = readState().tasks.find((t) => t.pane_id === params.pane_id && (params.session === undefined || t.session === params.session))
+        || upsertTask({ session: params.session, pane_id: params.pane_id, name: params.pane_id, cwd: ctx.cwd, command: "zellij_wait", status: "running", caller_session_file: ctx.sessionManager?.getSessionFile?.(), caller_session_id: ctx.sessionManager?.getSessionId?.() });
+      const eventDir = sessionEventDir(ctx);
+      const nodeCode = `
+        const fs = require("node:fs"); const path = require("node:path");
+        const dir = process.argv[1], taskId = process.argv[2], status = process.argv[3], code = Number(process.argv[4] || 0), msg = process.argv[5];
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const ev = { task_id: taskId, status, exit_code: code, completed_at: Date.now(), message: msg };
+        fs.writeFileSync(path.join(dir, taskId + ".wait." + Date.now() + ".json"), JSON.stringify(ev) + "\\n", { mode: 0o600 });
+      `.replace(/\s+/g, " ");
       const script = `
         out=$(mktemp /tmp/pi-zellij-wait.XXXXXX)
-        ${cmd} > "$out" 2>&1 & subpid=$!
-        status=1
-        for _ in $(seq 1 ${Math.max(1, Math.ceil(timeout * 2))}); do
-          if grep -Eiq -- ${q(params.pattern)} "$out"; then status=0; break; fi
+        (${cmd}) > "$out" 2>&1 & subpid=$!
+        status=unknown; code=1; msg=${q(`Timed out waiting for ${params.pattern}`)}
+        for _ in $(seq 1 ${iterations}); do
+          if grep -Eiq -- ${q(params.pattern)} "$out"; then status=ready; code=0; msg=${q(`Matched ${params.pattern}`)}; break; fi
           ${failCheck}
           sleep 0.5
         done
         kill "$subpid" 2>/dev/null || true
         wait "$subpid" 2>/dev/null || true
-        cat "$out"
+        node -e ${q(nodeCode)} ${q(eventDir)} ${q(task.id)} "$status" "$code" "$msg"
         rm -f "$out"
-        exit "$status"
+        exit 0
       `;
-      const result = await pi.exec("bash", ["-lc", script], { timeout: (timeout + 5) * 1000 });
-      const ok = result.code === 0;
-      const failed = result.code === 2;
-      upsertTask({ session: params.session, pane_id: params.pane_id, status: ok ? "ready" : failed ? "failed" : "unknown", last_snapshot: (result.stdout || result.stderr || "").slice(-4000) });
+      if (params.blocking === true) {
+        const result = await pi.exec("bash", ["-lc", script], { timeout: (timeout + 5) * 1000 });
+        refreshWidget(ctx);
+        return { content: [{ type: "text", text: result.stdout || result.stderr || "zellij_wait completed" }], details: { exitCode: result.code, task_id: task.id } };
+      }
+      const result = await pi.exec("bash", ["-lc", `(${script}) >/tmp/pi-zellij-wait-${task.id}.log 2>&1 & echo $!`], { timeout: 5_000 });
       refreshWidget(ctx);
-      return { content: [{ type: "text", text: ok ? `Matched ${params.pattern}\n${result.stdout}` : `${failed ? "Fail pattern matched" : `Did not match ${params.pattern}`} (exit ${result.code})\n${result.stdout || result.stderr}` }], isError: !ok, details: { exitCode: result.code } };
+      return { content: [{ type: "text", text: `Started non-blocking wait for ${q(params.pattern)} on ${params.session || "current"}:${params.pane_id}. Pi will receive a zellij-task-event when it matches/fails/times out.` }], details: { pid: result.stdout.trim(), task_id: task.id, event_dir: eventDir } };
     },
   });
 
