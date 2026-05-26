@@ -209,9 +209,9 @@ function pad(s: string, n: number): string { return s.length > n ? `${s.slice(0,
 function sessionMatchesTask(task: ZellijTask, ctx: any): boolean {
   const currentSessionFile = ctx?.sessionManager?.getSessionFile?.();
   const currentSessionId = ctx?.sessionManager?.getSessionId?.();
-  if (task.caller_session_file && currentSessionFile) return task.caller_session_file === currentSessionFile;
-  if (task.caller_session_id && currentSessionId) return task.caller_session_id === currentSessionId;
-  return !task.caller_session_file && !task.caller_session_id;
+  if (task.caller_session_file) return currentSessionFile === task.caller_session_file;
+  if (task.caller_session_id) return currentSessionId === task.caller_session_id;
+  return false;
 }
 
 function renderTaskLines(expanded = false, ctx?: any, scope: "session" | "all" = "session"): string[] {
@@ -253,9 +253,17 @@ async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent,
   const existing = readState().tasks.find((t) => t.id === event.task_id);
   const currentSessionFile = ctx?.sessionManager?.getSessionFile?.();
   const currentSessionId = ctx?.sessionManager?.getSessionId?.();
-  if (existing?.caller_session_file && currentSessionFile && existing.caller_session_file !== currentSessionFile) return false;
-  if (!existing?.caller_session_file && existing?.caller_session_id && currentSessionId && existing.caller_session_id !== currentSessionId) return false;
+  if (existing?.caller_session_file) return currentSessionFile === existing.caller_session_file ? await emitOwnedZellijEvent(pi, ctx, event, file) : false;
+  if (existing?.caller_session_id) return currentSessionId === existing.caller_session_id ? await emitOwnedZellijEvent(pi, ctx, event, file) : false;
 
+  // Legacy/unowned task: update shared state but do not inject into any Pi session.
+  const status: TaskStatus = event.exit_code === 0 ? "exited" : "failed";
+  updateTaskById(event.task_id, { status, last_exit_code: event.exit_code, event_emitted_at: Date.now() });
+  updateWidget(ctx);
+  return true;
+}
+
+async function emitOwnedZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent, file?: string): Promise<boolean> {
   const status: TaskStatus = event.exit_code === 0 ? "exited" : "failed";
   const task = updateTaskById(event.task_id, {
     status,
