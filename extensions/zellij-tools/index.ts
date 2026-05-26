@@ -206,8 +206,17 @@ function age(ms: number): string {
 
 function pad(s: string, n: number): string { return s.length > n ? `${s.slice(0, Math.max(0, n - 1))}…` : s.padEnd(n); }
 
-function renderTaskLines(expanded = false): string[] {
-  const tasks = readState().tasks;
+function sessionMatchesTask(task: ZellijTask, ctx: any): boolean {
+  const currentSessionFile = ctx?.sessionManager?.getSessionFile?.();
+  const currentSessionId = ctx?.sessionManager?.getSessionId?.();
+  if (task.caller_session_file && currentSessionFile) return task.caller_session_file === currentSessionFile;
+  if (task.caller_session_id && currentSessionId) return task.caller_session_id === currentSessionId;
+  return !task.caller_session_file && !task.caller_session_id;
+}
+
+function renderTaskLines(expanded = false, ctx?: any, scope: "session" | "all" = "session"): string[] {
+  const allTasks = readState().tasks;
+  const tasks = scope === "all" ? allTasks : allTasks.filter((t) => sessionMatchesTask(t, ctx));
   const activeStatuses = new Set<TaskStatus>(["starting", "running", "ready", "unknown"]);
   const active = tasks.filter((t) => activeStatuses.has(t.status));
 
@@ -215,7 +224,7 @@ function renderTaskLines(expanded = false): string[] {
     if (tasks.length === 0) return ["🧩 zellij tasks: none"];
     const rows = tasks.slice(0, 12).map((t) => `${statusIcon(t.status)} ${pad(t.status, 8)} ${pad(t.name, 24)} ${pad(`${t.session || "current"}:${t.pane_id}`, 32)} ${pad(age(t.created_at), 7)} exit:${t.last_exit_code ?? "-"}`);
     return [
-      `─── 🧩 zellij tasks · ${active.length} active / ${tasks.length} tracked · alt+z collapse ───`,
+      `─── 🧩 zellij tasks · ${scope} · ${active.length} active / ${tasks.length} tracked · alt+z collapse ───`,
       `  ${pad("status", 8)} ${pad("name", 24)} ${pad("pane", 32)} ${pad("age", 7)} exit`,
       ...rows,
     ];
@@ -228,9 +237,9 @@ function renderTaskLines(expanded = false): string[] {
   return [summary, ...recent];
 }
 
-function updateWidget(ctx: any, expanded = false) {
+function updateWidget(ctx: any, expanded = false, scope: "session" | "all" = "session") {
   if (!ctx?.hasUI) return;
-  const lines = renderTaskLines(expanded);
+  const lines = renderTaskLines(expanded, ctx, scope);
   if (!lines.length) return ctx.ui.setWidget("zellij-tasks", undefined);
   ctx.ui.setWidget("zellij-tasks", (_tui: any, theme: any) => ({
     render(width: number): string[] {
@@ -344,7 +353,8 @@ function looksLongRunning(command: string): boolean {
 export default function (pi: ExtensionAPI) {
   let eventWatcher: fs.FSWatcher | undefined;
   let dashboardExpanded = false;
-  const refreshWidget = (ctx: any) => updateWidget(ctx, dashboardExpanded);
+  let dashboardScope: "session" | "all" = "session";
+  const refreshWidget = (ctx: any) => updateWidget(ctx, dashboardExpanded, dashboardScope);
 
   pi.registerTool({
     name: "zellij_run",
@@ -505,7 +515,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       refreshWidget(ctx);
       const state = readState();
-      const lines = renderTaskLines(true);
+      const lines = renderTaskLines(true, ctx, dashboardScope);
       return {
         content: [{ type: "text", text: lines.length ? lines.join("\n") : "No tracked Zellij tasks." }],
         details: { state_file: STATE_FILE, tasks: state.tasks },
@@ -514,12 +524,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("zellij-cleanup", {
-    description: "Close/clear tracked Zellij tasks. Usage: /zellij-cleanup [active|stopped|all]. Default active",
+    description: "Close/clear tracked Zellij tasks. Usage: /zellij-cleanup [active|stopped|all] [session|global]. Default active session",
     handler: async (args, ctx) => {
-      const mode = (args || "active").trim() || "active";
+      const parts = (args || "active session").trim().split(/\s+/).filter(Boolean);
+      const mode = parts.find((p) => ["active", "stopped", "all"].includes(p)) || "active";
+      const global = parts.includes("global") || parts.includes("all-sessions");
       const state = readState();
       const activeStatuses = new Set<TaskStatus>(["starting", "running", "ready", "unknown"]);
-      const shouldClose = (t: ZellijTask) => mode === "all" ? true : mode === "active" ? activeStatuses.has(t.status) : false;
+      const inScope = (t: ZellijTask) => global || sessionMatchesTask(t, ctx);
+      const shouldClose = (t: ZellijTask) => inScope(t) && (mode === "all" ? true : mode === "active" ? activeStatuses.has(t.status) : false);
       let closed = 0;
       for (const task of state.tasks) {
         if (!shouldClose(task)) continue;
@@ -531,24 +544,28 @@ export default function (pi: ExtensionAPI) {
         }
       }
       let kept = state.tasks;
-      if (mode === "active") kept = state.tasks.filter((t) => !activeStatuses.has(t.status));
-      else if (mode === "stopped") kept = state.tasks.filter((t) => activeStatuses.has(t.status));
-      else if (mode === "all") kept = [];
+      if (mode === "active") kept = state.tasks.filter((t) => !(inScope(t) && activeStatuses.has(t.status)));
+      else if (mode === "stopped") kept = state.tasks.filter((t) => !inScope(t) || activeStatuses.has(t.status));
+      else if (mode === "all") kept = state.tasks.filter((t) => !inScope(t));
       writeState({ version: 1, tasks: kept });
       refreshWidget(ctx);
-      ctx.ui.notify(`zellij cleanup ${mode}: closed ${closed}, cleared ${state.tasks.length - kept.length}, tracking ${kept.length}`, "info");
+      ctx.ui.notify(`zellij cleanup ${mode} ${global ? "global" : "session"}: closed ${closed}, cleared ${state.tasks.length - kept.length}, tracking ${kept.length}`, "info");
     },
   });
 
   pi.registerCommand("zellij-dashboard", {
-    description: "Toggle or control the Zellij task dashboard. Usage: /zellij-dashboard [toggle|expand|collapse]",
+    description: "Toggle/control the Zellij task dashboard. Usage: /zellij-dashboard [toggle|expand|collapse|session|all|scope]",
     handler: async (args, ctx) => {
-      const action = (args || "toggle").trim();
-      if (action === "expand") dashboardExpanded = true;
+      const parts = (args || "toggle").trim().split(/\s+/).filter(Boolean);
+      const action = parts[0] || "toggle";
+      if (parts.includes("all") || action === "all") dashboardScope = "all";
+      if (parts.includes("session") || action === "session") dashboardScope = "session";
+      if (action === "scope") dashboardScope = dashboardScope === "session" ? "all" : "session";
+      else if (action === "expand") dashboardExpanded = true;
       else if (action === "collapse") dashboardExpanded = false;
-      else dashboardExpanded = !dashboardExpanded;
+      else if (!["all", "session"].includes(action)) dashboardExpanded = !dashboardExpanded;
       refreshWidget(ctx);
-      ctx.ui.notify(`zellij dashboard ${dashboardExpanded ? "expanded" : "collapsed"}`, "info");
+      ctx.ui.notify(`zellij dashboard ${dashboardExpanded ? "expanded" : "collapsed"} (${dashboardScope})`, "info");
     },
   });
 
@@ -557,7 +574,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (ctx) => {
       dashboardExpanded = !dashboardExpanded;
       refreshWidget(ctx);
-      ctx.ui.notify(`zellij dashboard ${dashboardExpanded ? "expanded" : "collapsed"}`, "info");
+      ctx.ui.notify(`zellij dashboard ${dashboardExpanded ? "expanded" : "collapsed"} (${dashboardScope})`, "info");
     },
   });
 

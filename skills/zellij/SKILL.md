@@ -63,7 +63,7 @@ Prefer checking `zellij_tasks` before spawning long-running work if there may al
 
 Default layout policy: open background observer tasks as tabs (`placement: "tab"`) so each task has a visible full pane. Use pane splits only for tightly related subtasks, and keep at most two panes per tab.
 
-The collapsed widget only shows active/actionable tasks. Use `/zellij-dashboard toggle` or `alt+z` to expand/collapse the full task-history table. Use `/zellij-cleanup active` to close active tracked panes and remove them from the dashboard, `/zellij-cleanup stopped` to clear stopped history, or `/zellij-cleanup all` to close tracked panes and clear all history.
+The collapsed widget and expanded dashboard are session-scoped by default. Use `/zellij-dashboard all` to show all sessions, `/zellij-dashboard session` to return to current-session view, or `/zellij-dashboard scope` to toggle scope. The collapsed widget only shows active/actionable tasks. Use `/zellij-dashboard toggle` or `alt+z` to expand/collapse the full task-history table. Use `/zellij-cleanup active` to close active tracked panes and remove them from the dashboard, `/zellij-cleanup stopped` to clear stopped history, or `/zellij-cleanup all` to close tracked panes and clear all history.
 
 ### Automatic completion events
 
