@@ -172,7 +172,7 @@ function updateTaskById(taskId: string, patch: Partial<ZellijTask>): ZellijTask 
   return updated;
 }
 
-function writeEventCommand(taskId: string): string {
+function writeEventCommand(taskId: string, eventDir: string): string {
   const nodeCode = `
     const fs = require("node:fs");
     const path = require("node:path");
@@ -184,11 +184,11 @@ function writeEventCommand(taskId: string): string {
     const file = path.join(dir, taskId + "." + Date.now() + ".json");
     fs.writeFileSync(file, JSON.stringify(ev) + "\\n", { mode: 0o600 });
   `.replace(/\s+/g, " ");
-  return `node -e ${q(nodeCode)} ${q(EVENTS_DIR)} ${q(taskId)} "$__pi_zellij_code"`;
+  return `node -e ${q(nodeCode)} ${q(eventDir)} ${q(taskId)} "$__pi_zellij_code"`;
 }
 
-function wrapCommandForEvent(command: string, taskId: string): string {
-  return `__pi_zellij_emit() { __pi_zellij_code=$?; trap - EXIT; ${writeEventCommand(taskId)}; exit "$__pi_zellij_code"; }; trap __pi_zellij_emit EXIT;\n${command}`;
+function wrapCommandForEvent(command: string, taskId: string, eventDir: string): string {
+  return `__pi_zellij_emit() { __pi_zellij_code=$?; trap - EXIT; ${writeEventCommand(taskId, eventDir)}; exit "$__pi_zellij_code"; }; trap __pi_zellij_emit EXIT;\n${command}`;
 }
 
 function statusIcon(status: TaskStatus): string {
@@ -249,6 +249,15 @@ function updateWidget(ctx: any, expanded = false, scope: "session" | "all" = "se
   }));
 }
 
+function safeId(value: unknown): string {
+  return String(value || "unknown").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 160);
+}
+
+function sessionEventDir(ctx: any): string {
+  const sessionId = ctx?.sessionManager?.getSessionId?.() || safeId(ctx?.sessionManager?.getSessionFile?.() || "no-session");
+  return path.join(EVENTS_DIR, "sessions", safeId(sessionId));
+}
+
 async function handleZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEvent, file?: string): Promise<boolean> {
   const existing = readState().tasks.find((t) => t.id === event.task_id);
   const currentSessionFile = ctx?.sessionManager?.getSessionFile?.();
@@ -290,11 +299,12 @@ async function emitOwnedZellijEvent(pi: ExtensionAPI, ctx: any, event: ZellijEve
 }
 
 function startEventWatcher(pi: ExtensionAPI, ctx: any): fs.FSWatcher | undefined {
-  fs.mkdirSync(EVENTS_DIR, { recursive: true, mode: 0o700 });
+  const watchDir = sessionEventDir(ctx);
+  fs.mkdirSync(watchDir, { recursive: true, mode: 0o700 });
   const seen = new Set<string>();
   const processFile = (name: string) => {
     if (!name.endsWith(".json")) return;
-    const file = path.join(EVENTS_DIR, name);
+    const file = path.join(watchDir, name);
     if (seen.has(file)) return;
     setTimeout(async () => {
       try {
@@ -309,8 +319,8 @@ function startEventWatcher(pi: ExtensionAPI, ctx: any): fs.FSWatcher | undefined
       }
     }, 100);
   };
-  for (const name of fs.readdirSync(EVENTS_DIR)) processFile(name);
-  return fs.watch(EVENTS_DIR, (_event, filename) => filename && processFile(String(filename)));
+  for (const name of fs.readdirSync(watchDir)) processFile(name);
+  return fs.watch(watchDir, (_event, filename) => filename && processFile(String(filename)));
 }
 
 function q(s: string): string {
@@ -379,7 +389,8 @@ export default function (pi: ExtensionAPI) {
       const taskId = newTaskId();
       const notifyAgentOnExit = params.notify_agent_on_exit !== false;
       const triggerAgentOnExit = params.trigger_agent_on_exit !== false;
-      const command = wrapCommandForEvent(params.command, taskId);
+      const eventDir = sessionEventDir(ctx);
+      const command = wrapCommandForEvent(params.command, taskId, eventDir);
 
       if (detached) {
         await exec(pi, ["attach", "--create-background", session, "options", "--web-sharing", "on", "--web-server", "true"], 20_000);
@@ -421,7 +432,7 @@ export default function (pi: ExtensionAPI) {
       const subscribeCommand = makeSubscribeCommand(session, paneId);
       return {
         content: [{ type: "text", text: `Started ${q(params.command)} in ${session}:${paneId}\nMonitor with:\n${subscribeCommand}` }],
-        details: { task_id: task.id, session, pane_id: paneId, tab_id: tabId, placement, name, cwd, command: params.command, subscribe_command: subscribeCommand },
+        details: { task_id: task.id, session, pane_id: paneId, tab_id: tabId, placement, name, cwd, command: params.command, event_dir: eventDir, subscribe_command: subscribeCommand },
       };
     },
   });
