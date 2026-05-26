@@ -45,7 +45,7 @@ Typical tool flow:
 1. `zellij_run` starts the command and returns `session` + `pane_id`. By default detached tasks open in their own tab; use `placement: "pane"` only when a split is desired.
 2. `zellij_subscribe` streams recent output.
 3. `zellij_wait` waits for readiness/failure patterns.
-4. `zellij_snapshot` captures final screen state if needed.
+4. `zellij_snapshot` captures recent screen state if needed; it defaults to the latest 80 lines, use `full: true` only when necessary.
 5. `zellij_close` stops the pane when done.
 
 ## 3.5 Task State & Toolbar

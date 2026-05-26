@@ -72,6 +72,18 @@ const PaneParams = {
   additionalProperties: false,
 } as const;
 
+const SnapshotParams = {
+  type: "object",
+  properties: {
+    pane_id: S.string("Pane ID, eg terminal_1"),
+    session: S.string("Zellij session name"),
+    lines: S.number("Return only the latest N lines. Default 80"),
+    full: S.boolean("Return full scrollback. Default false"),
+  },
+  required: ["pane_id"],
+  additionalProperties: false,
+} as const;
+
 const SubscribeParams = {
   type: "object",
   properties: {
@@ -520,13 +532,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "zellij_snapshot",
     label: "Zellij Snapshot",
-    description: "Dump the current rendered pane contents, including scrollback.",
-    parameters: PaneParams,
+    description: "Dump the current rendered pane contents. Defaults to only the latest 80 lines to avoid flooding context; pass full=true for full scrollback.",
+    parameters: SnapshotParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const result = await exec(pi, [...sessionArgs(params.session), "action", "dump-screen", "--pane-id", params.pane_id, "--full"], 20_000);
-      upsertTask({ session: params.session, pane_id: params.pane_id, status: result.code === 0 ? "running" : "unknown", last_snapshot: (result.stdout || result.stderr || "").slice(-4000) });
+      const result = await exec(pi, [...sessionArgs(params.session), "action", "dump-screen", "--pane-id", params.pane_id, ...(params.full ? ["--full"] : [])], 20_000);
+      const raw = result.stdout || result.stderr || "";
+      const lineCount = Math.max(1, params.lines ?? 80);
+      const text = params.full ? raw : raw.split(/\r?\n/).slice(-lineCount).join("\n");
+      upsertTask({ session: params.session, pane_id: params.pane_id, status: result.code === 0 ? "running" : "unknown", last_snapshot: text.slice(-4000) });
       refreshWidget(ctx);
-      return { content: [{ type: "text", text: result.stdout || result.stderr }], isError: result.code !== 0, details: { exitCode: result.code } };
+      return { content: [{ type: "text", text }], isError: result.code !== 0, details: { exitCode: result.code, lines: params.full ? undefined : lineCount, full: !!params.full } };
     },
   });
 
