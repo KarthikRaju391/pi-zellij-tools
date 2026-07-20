@@ -26,6 +26,14 @@ pi -e git:github.com/KarthikRaju391/pi-zellij-tools
 
 Then restart Pi or run `/reload`.
 
+### Agent-memory monitor
+
+Install the trusted canonical extension with a symlink or copy at `~/.pi/agent/extensions/agent-memory-monitor.ts`, then run `/reload`.
+
+```text
+/agent-memory-monitor on|off|status|scan
+```
+
 ## Usage
 
 ```ts
