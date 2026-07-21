@@ -37,30 +37,51 @@ export class Controller {
       const request = await this.store.readCancel(this.run.id);
       if (request) await this.enqueue(() => this.applyCancelRequest(request));
       else if (this.run.status === "cancelling") await this.enqueue(async () => { await this._cancel(this.run.reason); if (this.run.status === "cancelled") await this.close(); return this.run; });
+      else if (this.run.status === "closing") await this.enqueue(() => this._finishClosing());
       return this.run;
     } finally { this.cancelPollInFlight = false; }
   }
   async applyCancelRequest(request) {
     if (request.runId !== this.run.id) return this.run;
+    if (this.run.status === "closing") { await this.store.consumeCancel(this.run.id, request.id); return this._finishClosing(); }
     if (!["done", "failed", "cancelled"].includes(this.run.status)) await this._cancel(request.reason, request.id);
     if (this.run.status !== "cancelled") return this.run;
     await this.close(); await this.store.consumeCancel(this.run.id, request.id); return this.run;
   }
   async close() {
+    if (this.run?.status === "closing") return this._finishClosing();
     if (this.closePromise) return this.closePromise;
     this.closePromise = (async () => {
       await this.workers?.shutdown?.();
+      if (this.run && await this.store.workersAlive(this.run)) return this.run;
       this.closed = true; this.stopCancelWatcher(); this.signalCleanup?.(); this.signalCleanup = undefined;
       await this.lease?.release();
       if (this.run && ["done", "cancelled", "failed"].includes(this.run.status)) await this.store.releaseClaim(this.run.taskKey, this.run.cwd, this.run.id);
+      return this.run;
     })();
     try { return await this.closePromise; }
     finally { if (!this.closed) this.closePromise = undefined; }
+  }
+  async beginClosing(outcome) {
+    if (this.run.status !== "closing") await this.event(this.fenced("closing", outcome));
+    return this._finishClosing();
+  }
+  async _finishClosing() {
+    if (this.run.status !== "closing") return this.run;
+    try { await this.workers?.shutdown?.(); }
+    catch (error) { this.shutdownError = error; return this.run; }
+    if (await this.store.workersAlive(this.run)) return this.run;
+    const pending = this.run.pending;
+    if (pending?.status === "done") await this.event(this.fenced("complete", { pr: pending.pr }));
+    else if (pending?.status === "failed") await this.event(this.fenced("failed", { reason: pending.reason }));
+    else throw new Error("closing run has no terminal outcome");
+    return this.close();
   }
   fenced(type, extra = {}) { return { id: idFor("event", { run: this.run.id, generation: this.run.generation, lease: this.run.lease, round: this.run.reviewRounds, type, extra }), type, generation: this.run.generation, lease: this.run.lease, ...extra }; }
   async event(event) { this.run = await this.store.append(this.run, event); return this.run; }
   async waitForHuman(reason) { await this.event(this.fenced("recovery-wait", { reason })); await this.close(); return this.run; }
   async recover() {
+    if (this.run.status === "closing") return this._finishClosing();
     const writer = Object.values(this.run.nodes).find((node) => node.role === "writer" && ["running", "retry"].includes(node.status));
     const writeEffect = Object.values(this.run.effects).find((effect) => effect.status === "started" && [Effect.COMMIT, Effect.REBASE, Effect.PUBLISH_PR].includes(effect.kind));
     if (writer || writeEffect) return this.event(this.fenced("recovery-wait", { reason: writer ? "recovery-interrupted-writer" : `recovery-interrupted-${writeEffect.kind}` }));
@@ -75,8 +96,8 @@ export class Controller {
   }
   async pump() { return this.enqueue(() => this._pump()); }
   async _pump() {
-    if (this.run.status === "cancelling") return this.run;
-    while (!TERMINAL.has(this.run.status)) { const next = this.next(); if (next.type === "wait") return this.run; if (next.type === "stop") return this.event(this.fenced("recovery-wait", { reason: next.reason })); if (next.type === "finished") { if (this.run.workflow !== "fix-to-pr") await this.event(this.fenced("complete", { pr: undefined })); return this.run; } if (next.type === "parallel-dispatch") { for (const stage of next.stage.nodes) if (this.stageState(stage) === "dispatch") await this.dispatch(stage); return this.run; } if (next.type === "agent") { await this.dispatch(next.stage); return this.run; } await this.effect(next.stage); }
+    if (["cancelling", "closing"].includes(this.run.status)) return this.run;
+    while (!TERMINAL.has(this.run.status)) { const next = this.next(); if (next.type === "wait") return this.run; if (next.type === "stop") return this.event(this.fenced("recovery-wait", { reason: next.reason })); if (next.type === "finished") { if (this.run.workflow !== "fix-to-pr") return this.beginClosing({ outcome: "done" }); return this.run; } if (next.type === "parallel-dispatch") { for (const stage of next.stage.nodes) if (this.stageState(stage) === "dispatch") await this.dispatch(stage); return this.run; } if (next.type === "agent") { await this.dispatch(next.stage); return this.run; } await this.effect(next.stage); }
     return this.run;
   }
   async dispatch(stage) {
@@ -88,7 +109,7 @@ export class Controller {
   }
   onWorkerEvent(stage, event, worker) { return this.enqueue(() => this._onWorkerEvent(stage, event, worker)); }
   async _onWorkerEvent(stage, event, worker) {
-    if (TERMINAL.has(this.run.status) || this.run.status === "cancelling") return;
+    if (TERMINAL.has(this.run.status) || ["cancelling", "closing"].includes(this.run.status)) return;
     if (event.type === "stderr") return; // pi-pool emits account/status diagnostics on stderr.
     if (["process_exit", "process_error", "protocol_error"].includes(event.type) && this.run.nodes[stage.id]?.status === "running") return this.waitForHuman(`worker-${stage.id}-${event.type}`);
     if (event.type === "tool_execution_end" && event.toolName === "orchestrator_report" && !event.isError) {
@@ -110,14 +131,14 @@ export class Controller {
     if ([Effect.RECONCILE_PR, Effect.PUBLISH_PR].includes(kind)) { const review = this.run.nodes["review-head"]; approvedHead = review?.status === "approved" ? review.head : undefined; let current; try { current = await this.effects.head(); } catch { return this.event(this.fenced("recovery-wait", { reason: "cannot-read-final-head" })); } if (!approvedHead || current !== approvedHead) return this.event(this.fenced("recovery-wait", { reason: "final-review-head-stale" })); } const old = this.run.effects[stage.id];
     if (old?.status === "started" && [Effect.COMMIT, Effect.REBASE, Effect.PUBLISH_PR].includes(old.kind)) return this.event(this.fenced("recovery-wait", { reason: `interrupted-${old.kind}` }));
     const attempt = (old?.attempts ?? 0) + 1; let beforeHead; try { beforeHead = await this.effects.head(); } catch {} await this.event(this.fenced("effect-started", { effect: stage.id, kind, attempt, beforeHead, approvedHead }));
-    try { const result = await this.effects.run(kind, { approvedHead }); await this.event(this.fenced("effect-finished", { effect: stage.id, kind, outcome: "ok", result, attempt })); if (kind === Effect.RECONCILE_PR && result.existing) return this.event(this.fenced("complete", { pr: result.existing })); if (kind === Effect.PUBLISH_PR) await this.event(this.fenced("complete", { pr: result.pr })); }
+    try { const result = await this.effects.run(kind, { approvedHead }); await this.event(this.fenced("effect-finished", { effect: stage.id, kind, outcome: "ok", result, attempt })); if (kind === Effect.RECONCILE_PR && result.existing) return this.beginClosing({ outcome: "done", pr: result.existing }); if (kind === Effect.PUBLISH_PR) return this.beginClosing({ outcome: "done", pr: result.pr }); }
     catch (error) { if (kind === Effect.CHECKS && attempt < 2) await this.event(this.fenced("effect-finished", { effect: stage.id, kind, outcome: "failed", result: String(error), attempt })); else if (kind === Effect.CHECKS) await this.event(this.fenced("review-changes", { node: "write", feedback: `Configured check failed twice: ${String(error).slice(0, 4000)}` })); else await this.event(this.fenced("recovery-wait", { reason: `interrupted-or-failed-${kind}` })); }
     return this.run;
   }
   async requestCancellation(id, reason = "CLI cancel") {
     const persisted = await this.store.load(id);
     if (persisted.status === "cancelled") { const request = await this.store.readCancel(id); if (request) await this.store.consumeCancel(id, request.id); return persisted; }
-    if (["done", "failed"].includes(persisted.status)) throw new Error(`cannot cancel ${persisted.status} run`);
+    if (["done", "failed", "closing"].includes(persisted.status)) throw new Error(`cannot cancel ${persisted.status} run`);
     const request = await this.store.requestCancel(id, reason);
     if (this.run?.id === id && this.lease?.token) return this.enqueue(() => this.applyCancelRequest(request));
     this.run = persisted;
@@ -157,7 +178,7 @@ export class Controller {
   installSignalHandlers(target = process) {
     const handle = (signal) => {
       if (this.signalPromise) return;
-      this.signalPromise = this.enqueue(async () => { if (this.run && !["done", "failed", "cancelled"].includes(this.run.status)) await this._cancel(`received ${signal}`); if (this.run?.status === "cancelled") { await this.close(); target.exitCode = signal === "SIGINT" ? 130 : 143; } }).catch((error) => { target.exitCode = 1; console.error(error); });
+      this.signalPromise = this.enqueue(async () => { if (this.run && !["done", "failed", "cancelled", "closing"].includes(this.run.status)) await this._cancel(`received ${signal}`); if (this.run?.status === "cancelled") { await this.close(); target.exitCode = signal === "SIGINT" ? 130 : 143; } }).catch((error) => { target.exitCode = 1; console.error(error); });
     };
     const onInt = () => handle("SIGINT"); const onTerm = () => handle("SIGTERM"); target.once("SIGINT", onInt); target.once("SIGTERM", onTerm);
     this.signalCleanup = () => { target.removeListener("SIGINT", onInt); target.removeListener("SIGTERM", onTerm); };
@@ -167,11 +188,11 @@ export class Controller {
     if (!Object.hasOwn(this.run.nodes, target) && !Object.hasOwn(this.run.effects, target)) throw new Error("reconciliation target is not persisted");
     if (!["abandon", "confirmed-applied", "confirmed-not-applied"].includes(decision)) throw new Error("specific reconciliation decision required");
     if (this.run.nodes[target]?.role === "writer" && decision !== "abandon") throw new Error("an interrupted writer cannot be replayed or marked applied");
-    return this.enqueue(async () => { let result; let kind; if (decision === "confirmed-applied") { kind = this.run.effects[target]?.kind; if (kind !== Effect.PUBLISH_PR) throw new Error("confirmed-applied is allowed only for exact open PR proof"); const review = this.run.nodes["review-head"]; const approvedHead = review?.status === "approved" ? review.head : undefined; const current = approvedHead && await this.effects.head(); if (!approvedHead || current !== approvedHead) throw new Error("final review HEAD is no longer current"); if (!this.effects.prove) throw new Error("exact read-only proof is unavailable"); result = await this.effects.prove(kind, this.run.effects[target], { approvedHead }); if (!result?.pr) throw new Error("exact proof did not establish outcome"); } await this.event(this.fenced("reconcile", { target, decision, result })); if (kind === Effect.PUBLISH_PR && decision === "confirmed-applied") await this.event(this.fenced("complete", { pr: result.pr })); if (this.run.status === "running") await this._pump(); return this.run; });
+    return this.enqueue(async () => { let result; let kind; if (decision === "confirmed-applied") { kind = this.run.effects[target]?.kind; if (kind !== Effect.PUBLISH_PR) throw new Error("confirmed-applied is allowed only for exact open PR proof"); const review = this.run.nodes["review-head"]; const approvedHead = review?.status === "approved" ? review.head : undefined; const current = approvedHead && await this.effects.head(); if (!approvedHead || current !== approvedHead) throw new Error("final review HEAD is no longer current"); if (!this.effects.prove) throw new Error("exact read-only proof is unavailable"); result = await this.effects.prove(kind, this.run.effects[target], { approvedHead }); if (!result?.pr) throw new Error("exact proof did not establish outcome"); } await this.event(this.fenced("reconcile", { target, decision, result })); if (this.run.status === "closing") return this._finishClosing(); if (kind === Effect.PUBLISH_PR && decision === "confirmed-applied") return this.beginClosing({ outcome: "done", pr: result.pr }); if (this.run.status === "running") await this._pump(); return this.run; });
   }
   async _cancel(reason, requestId) {
     if (this.run.status === "cancelled") return this.run;
-    if (["done", "failed"].includes(this.run.status)) throw new Error(`cannot cancel ${this.run.status} run`);
+    if (["done", "failed", "closing"].includes(this.run.status)) throw new Error(`cannot cancel ${this.run.status} run`);
     if (this.run.status !== "cancelling") await this.event(this.fenced("cancelling", { reason, requestId }));
     try { await this.workers?.shutdown?.(); }
     catch (error) { this.shutdownError = error; return this.run; }

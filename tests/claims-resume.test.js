@@ -47,8 +47,8 @@ test("terminal owners stay claimed while live and are reclaimable only after ver
     await store.claim(run.taskKey, run.cwd, run.id); run = await store.create(run);
     run = await store.append(run, event(run, "recovery-wait", { reason: "human" }));
     await assert.rejects(store.claim(run.taskKey, run.cwd, "blocked"), /active claim/);
-    const terminalEvent = terminal === "done" ? ["complete", {}] : terminal === "cancelled" ? ["cancel", {}] : ["reconcile", { target: "x", decision: "abandon" }];
-    run = await store.append(run, event(run, terminalEvent[0], terminalEvent[1]));
+    const events = terminal === "done" ? [["closing", { outcome: "done" }], ["complete", {}]] : terminal === "cancelled" ? [["cancel", {}]] : [["reconcile", { target: "x", decision: "abandon" }], ["failed", {}]];
+    for (const [type, extra] of events) run = await store.append(run, event(run, type, extra));
     assert.equal(run.status, terminal); await assert.rejects(store.claim(run.taskKey, run.cwd, `new-${terminal}`), /active claim/);
     await store.releaseClaim(run.taskKey, run.cwd, run.id); await store.claim(run.taskKey, run.cwd, `new-${terminal}`);
     for (const file of store.claimFiles(run.taskKey, run.cwd)) assert.equal(JSON.parse(await readFile(file, "utf8")).runId, `new-${terminal}`);

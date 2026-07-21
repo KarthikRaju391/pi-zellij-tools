@@ -44,7 +44,7 @@ export function reduce(run, event) {
   if (event.type !== "lease-acquired" && !current(run, event)) return once(run, event);
   const next = once(run, event);
   switch (event.type) {
-    case "lease-acquired": return { ...next, lease: event.lease, generation: event.generation, status: TERMINAL.has(next.status) || next.status === "cancelling" ? next.status : "running" };
+    case "lease-acquired": return { ...next, lease: event.lease, generation: event.generation, status: TERMINAL.has(next.status) || ["cancelling", "closing"].includes(next.status) ? next.status : "running" };
     case "node-started": {
       if (event.role === "writer" && Object.values(next.nodes).some((n) => n.role === "writer" && n.status === "running")) return { ...next, status: "waiting-human", reason: "second-writer-blocked" };
       const old = next.nodes[event.node];
@@ -81,14 +81,16 @@ export function reduce(run, event) {
       return { ...next, status: "running", reason: undefined, nodes };
     }
     case "reconcile": {
-      if (event.decision === "abandon") return { ...next, status: "failed", reason: `abandoned-${event.target}` };
+      if (event.decision === "abandon") return { ...next, status: "closing", pending: { status: "failed", reason: `abandoned-${event.target}` } };
       if (event.decision === "confirmed-not-applied") { const effects = { ...next.effects }; if (effects[event.target]) delete effects[event.target]; const nodes = { ...next.nodes }; if (nodes[event.target]) nodes[event.target] = { ...nodes[event.target], status: "retry" }; return { ...next, status: "running", effects, nodes, reason: undefined }; }
       if (event.decision === "confirmed-applied") { const effects = { ...next.effects }; const nodes = { ...next.nodes }; if (effects[event.target]) effects[event.target] = { ...effects[event.target], status: "ok", result: event.result }; if (nodes[event.target]) nodes[event.target] = { ...nodes[event.target], status: "ok", head: event.result?.head ?? nodes[event.target].head }; return { ...next, status: "running", effects, nodes, reason: undefined }; }
       return next;
     }
     case "cancelling": return { ...next, status: "cancelling", reason: event.reason ?? "cancelled" };
     case "cancel": return { ...next, status: "cancelled", reason: event.reason ?? "cancelled" };
-    case "complete": return { ...next, status: "done", pr: event.pr, ci: "pending" };
+    case "closing": return { ...next, status: "closing", pending: { status: event.outcome, pr: event.pr, reason: event.reason } };
+    case "complete": return { ...next, status: "done", pr: event.pr ?? next.pending?.pr, ci: "pending", pending: undefined };
+    case "failed": return { ...next, status: "failed", reason: event.reason ?? next.pending?.reason, pending: undefined };
     default: throw new Error(`unknown event type: ${event.type}`);
   }
 }

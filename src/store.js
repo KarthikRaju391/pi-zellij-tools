@@ -36,11 +36,17 @@ async function defaultOwnerAlive(owner) {
   catch { return true; }
 }
 
+function defaultWorkerAlive(pid) {
+  try { process.kill(process.platform === "win32" ? pid : -pid, 0); return true; }
+  catch (error) { return error.code === "ESRCH" ? false : true; }
+}
+
 export class Store {
-  constructor(dir = defaultStateDir(), { owner = defaultOwner, ownerAlive = defaultOwnerAlive } = {}) {
+  constructor(dir = defaultStateDir(), { owner = defaultOwner, ownerAlive = defaultOwnerAlive, workerAlive = defaultWorkerAlive } = {}) {
     this.dir = dir;
     this.owner = owner;
     this.ownerAlive = ownerAlive;
+    this.workerAlive = workerAlive;
   }
   async init() { await privateDir(this.dir); await privateDir(join(this.dir, "workers")); }
   claimFiles(taskKey, cwd) {
@@ -82,6 +88,10 @@ export class Store {
     if (!owner?.runId) return await this.ownerAlive(owner);
     try { return !terminalClaimOwners.has((await this.load(owner.runId)).status) || await this.ownerAlive(owner); }
     catch { return await this.ownerAlive(owner); }
+  }
+  async workersAlive(run) {
+    const pids = [...new Set(Object.values(run.nodes).map((node) => node.pid).filter((pid) => Number.isInteger(pid) && pid > 0))];
+    return (await Promise.all(pids.map((pid) => this.workerAlive(pid)))).some(Boolean);
   }
   async removeIfOwned(file, runId) {
     try {

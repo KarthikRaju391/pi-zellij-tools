@@ -85,11 +85,24 @@ test("a shutdown timeout retains cancelling state and claims until a late exit r
   assert.equal(ctl.run.status, "cancelled"); assert.equal(await store.readCancel(ctl.run.id), undefined); assert.equal(request.runId, ctl.run.id);
 });
 
-test("normal completion does not release claims before its worker exits", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "done-close-")); const store = new Store(dir); const { adapter, started } = fakeWorkers(dir, [], { autoExit: false });
+test("completion stays closing across a controller crash until its persisted worker group exits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "done-close-")); let alive = true; const store = new Store(dir, { workerAlive: async () => alive }); const { adapter, started } = fakeWorkers(dir, [], { autoExit: false, shutdownTimeout: 10 });
   const ctl = new Controller({ store, workers: adapter, effectsFor: () => effects }); await ctl.start({ workflow: "investigate-report", spec: readSpec({ taskKey: "done-close" }) }); await ctl.pump(); report(ctl, started[0], "investigate");
-  await ready(() => ctl.run.status === "done" && started[0].child.killed); await assert.rejects(store.claim("replacement", ctl.run.cwd, "replacement"), /active claim/);
-  started[0].child.emit("exit", 0, "SIGTERM"); await ready(async () => { try { await store.claim("replacement", ctl.run.cwd, "replacement"); return true; } catch { return false; } });
+  await ready(() => ctl.run.status === "closing" && started[0].child.killed); assert.equal((await store.load(ctl.run.id)).status, "closing"); await assert.rejects(store.claim("replacement", ctl.run.cwd, "replacement"), /active claim/);
+
+  ctl.stopCancelWatcher(); await ctl.lease.release(); // Simulate the timed-out controller dying without releasing its claim.
+  const resumed = new Controller({ store, workers: { async shutdown() {} }, effectsFor: () => effects }); await resumed.resume(ctl.run.id);
+  assert.equal(resumed.run.status, "closing"); await assert.rejects(store.claim("replacement", resumed.run.cwd, "replacement"), /active claim/);
+  alive = false; await resumed.recover(); assert.equal(resumed.run.status, "done");
+  await store.claim("replacement", resumed.run.cwd, "replacement");
+});
+
+test("abandon records closing before failed and retains claims after shutdown failure", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "abandon-close-")); let alive = true; const store = new Store(dir, { workerAlive: async () => alive });
+  let run = newRun({ workflow: "investigate-report", spec: readSpec({ taskKey: "abandon-close" }) }); run.status = "waiting-human"; run.nodes.investigate = { role: "investigator", status: "failed", pid: 9911 }; await store.claim(run.taskKey, run.cwd, run.id); run = await store.create(run);
+  const ctl = new Controller({ store, workers: { async shutdown() { throw new Error("timed out"); } }, effectsFor: () => effects }); ctl.run = run; ctl.plan = workflow(run.workflow);
+  await ctl.reconcile("investigate", "abandon"); assert.equal(ctl.run.status, "closing"); assert.equal((await store.load(run.id)).status, "closing"); await assert.rejects(store.claim("replacement", run.cwd, "replacement"), /active claim/);
+  alive = false; ctl.workers = { async shutdown() {} }; await ctl.recover(); assert.equal(ctl.run.status, "failed"); await store.claim("replacement", run.cwd, "replacement");
 });
 
 test("a failed lease contender cannot release the active owner's lease", async () => {
