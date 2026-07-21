@@ -1,34 +1,153 @@
-import { chmod, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { realpathSync } from "node:fs";
+import { chmod, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { promisify } from "node:util";
 import { assertRun, reduce } from "./state.js";
 
+const exec = promisify(execFile);
 const home = process.env.HOME ?? ".";
+const terminalClaimOwners = new Set(["done", "cancelled", "failed"]);
 export const defaultStateDir = () => process.env.PI_ORCH_STATE_DIR ?? join(home, ".pi", "orchestrator");
 const files = (dir, id) => ({ journal: join(dir, `${id}.jsonl`), snapshot: join(dir, `${id}.json`), lease: join(dir, `${id}.lease`) });
 const privateDir = async (dir) => { await mkdir(dir, { recursive: true, mode: 0o700 }); await chmod(dir, 0o700); };
+const canonical = (path) => { try { return realpathSync(resolve(path)); } catch { return resolve(path); } };
+
+async function processStartIdentity(pid) {
+  const { stdout } = await exec("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+  const identity = stdout.trim();
+  if (!identity) throw new Error(`cannot identify process ${pid}`);
+  return identity;
+}
+
+let localOwner;
+async function defaultOwner() {
+  localOwner ??= { pid: process.pid, startIdentity: await processStartIdentity(process.pid), startedAt: Date.now() };
+  return localOwner;
+}
+
+async function defaultOwnerAlive(owner) {
+  if (!Number.isInteger(owner?.pid) || owner.pid < 1 || typeof owner.startIdentity !== "string" || !owner.startIdentity) return true;
+  try { process.kill(owner.pid, 0); }
+  catch (error) { return error.code === "ESRCH" ? false : true; }
+  try { return await processStartIdentity(owner.pid) === owner.startIdentity; }
+  catch { return true; }
+}
 
 export class Store {
-  constructor(dir = defaultStateDir()) { this.dir = dir; }
+  constructor(dir = defaultStateDir(), { owner = defaultOwner, ownerAlive = defaultOwnerAlive } = {}) {
+    this.dir = dir;
+    this.owner = owner;
+    this.ownerAlive = ownerAlive;
+  }
   async init() { await privateDir(this.dir); await privateDir(join(this.dir, "workers")); }
-  claimFiles(taskKey, cwd) { const digest = (value) => createHash("sha256").update(value).digest("hex"); return [join(this.dir, `claim-task-${digest(taskKey)}.lock`), join(this.dir, `claim-cwd-${digest(cwd)}.lock`)]; }
-  async claim(taskKey, cwd, runId) { await this.init(); const mine = { runId, pid: process.pid, startedAt: Date.now() }; const acquired = []; const acquire = async (file) => { try { const h = await open(file, "wx", 0o600); await h.writeFile(JSON.stringify(mine)); await h.sync(); await h.close(); acquired.push(file); return; } catch (error) { if (error.code !== "EEXIST") throw error; } const owner = JSON.parse(await readFile(file, "utf8")); if (owner.runId === runId) return; let terminal = false; try { terminal = ["done", "cancelled", "failed"].includes((await this.load(owner.runId)).status); } catch { try { process.kill(owner.pid, 0); } catch (error) { terminal = error.code === "ESRCH"; } } if (!terminal) throw new Error("active claim"); await unlink(file); return acquire(file); }; try { for (const file of this.claimFiles(taskKey, cwd)) await acquire(file); } catch (error) { await Promise.all(acquired.map((file) => unlink(file).catch(() => {}))); throw error; } }
-  async releaseClaim(taskKey, cwd, runId) { await Promise.all(this.claimFiles(taskKey, cwd).map(async (file) => { try { if (JSON.parse(await readFile(file, "utf8")).runId === runId) await unlink(file); } catch {} })); }
+  claimFiles(taskKey, cwd) {
+    const digest = (value) => createHash("sha256").update(value).digest("hex");
+    return [join(this.dir, `claim-task-${digest(taskKey)}.lock`), join(this.dir, `claim-cwd-${digest(canonical(cwd))}.lock`)];
+  }
+  async ownerRecord(extra = {}) {
+    const owner = await this.owner();
+    if (!Number.isInteger(owner?.pid) || owner.pid < 1 || typeof owner.startIdentity !== "string" || !owner.startIdentity) throw new Error("claim owner requires PID/start identity");
+    return { ...owner, startedAt: owner.startedAt ?? Date.now(), ...extra };
+  }
+  async withClaimLock(fn) {
+    await this.init();
+    const file = join(this.dir, ".claims.lock");
+    let handle;
+    for (let attempt = 0; attempt < 500 && !handle; attempt++) {
+      try {
+        handle = await open(file, "wx", 0o600);
+        await handle.writeFile(JSON.stringify(await this.ownerRecord()));
+        await handle.sync();
+      } catch (error) {
+        const created = Boolean(handle); await handle?.close().catch(() => {}); handle = undefined;
+        if (created) { await unlink(file).catch(() => {}); throw error; }
+        if (error.code !== "EEXIST") throw error;
+        let owner;
+        try { owner = JSON.parse(await readFile(file, "utf8")); }
+        catch { throw new Error("claim lock is unreadable"); }
+        if (await this.ownerAlive(owner)) { await sleep(10); continue; }
+        const stale = `${file}.stale-${process.pid}-${randomUUID()}`;
+        try { await rename(file, stale); await unlink(stale); }
+        catch (moveError) { if (moveError.code !== "ENOENT") throw moveError; }
+      }
+    }
+    if (!handle) throw new Error("claim operation lock is busy");
+    try { return await fn(); }
+    finally { await handle.close(); await unlink(file).catch(() => {}); }
+  }
+  async claimIsActive(owner) {
+    if (!owner?.runId) return true;
+    try { return !terminalClaimOwners.has((await this.load(owner.runId)).status); }
+    catch { return await this.ownerAlive(owner); }
+  }
+  async removeIfOwned(file, runId) {
+    try {
+      const owner = JSON.parse(await readFile(file, "utf8"));
+      if (owner.runId === runId) await unlink(file);
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+  async acquireClaim(file, mine) {
+    for (;;) {
+      let handle;
+      try {
+        handle = await open(file, "wx", 0o600);
+        await handle.writeFile(JSON.stringify(mine));
+        await handle.sync();
+        await handle.close();
+        return true;
+      } catch (error) {
+        await handle?.close().catch(() => {});
+        if (error.code !== "EEXIST") { if (handle) await unlink(file).catch(() => {}); throw error; }
+      }
+      let owner;
+      try { owner = JSON.parse(await readFile(file, "utf8")); }
+      catch { throw new Error("claim is unreadable"); }
+      if (owner.runId === mine.runId) return false;
+      if (await this.claimIsActive(owner)) throw new Error(`active claim owned by ${owner.runId}`);
+      await unlink(file);
+    }
+  }
+  async claim(taskKey, cwd, runId) {
+    if (typeof runId !== "string" || !runId) throw new Error("runId is required for claim");
+    return this.withClaimLock(async () => {
+      const mine = await this.ownerRecord({ runId });
+      const acquired = [];
+      try {
+        for (const file of this.claimFiles(taskKey, cwd)) if (await this.acquireClaim(file, mine)) acquired.push(file);
+      } catch (error) {
+        for (const file of acquired) await this.removeIfOwned(file, runId);
+        throw error;
+      }
+    });
+  }
+  async releaseClaim(taskKey, cwd, runId) {
+    if (typeof runId !== "string" || !runId) throw new Error("runId is required to release claim");
+    return this.withClaimLock(async () => {
+      for (const file of this.claimFiles(taskKey, cwd)) await this.removeIfOwned(file, runId);
+    });
+  }
   async create(run) {
     await this.init(); const { journal } = files(this.dir, run.id);
     const handle = await open(journal, "wx", 0o600);
-    try { await handle.writeFile(`${JSON.stringify({ type: "seed", run })}\n`); await handle.sync(); } catch (error) { await unlink(journal).catch(() => {}); throw error; } finally { await handle.close(); }
+    try { await handle.writeFile(`${JSON.stringify({ type: "seed", run })}\n`); await handle.sync(); }
+    catch (error) { await unlink(journal).catch(() => {}); throw error; }
+    finally { await handle.close(); }
     await this.snapshot(run); return run;
   }
   async append(run, event) {
     const { journal } = files(this.dir, run.id); const handle = await open(journal, "a", 0o600);
-    try { await handle.write(`${JSON.stringify(event)}\n`); await handle.sync(); } finally { await handle.close(); }
+    try { await handle.write(`${JSON.stringify(event)}\n`); await handle.sync(); }
+    finally { await handle.close(); }
     const next = assertRun(reduce(run, event)); await this.snapshot(next); return next;
   }
   async snapshot(run) {
     const { snapshot } = files(this.dir, run.id); const temp = `${snapshot}.${process.pid}.${randomUUID()}.tmp`;
     const handle = await open(temp, "wx", 0o600);
-    try { await handle.writeFile(JSON.stringify(run)); await handle.sync(); } finally { await handle.close(); }
+    try { await handle.writeFile(JSON.stringify(run)); await handle.sync(); }
+    finally { await handle.close(); }
     await rename(temp, snapshot); await chmod(snapshot, 0o600);
     const directory = await open(dirname(snapshot), "r"); try { await directory.sync(); } finally { await directory.close(); }
   }
@@ -38,7 +157,7 @@ export class Store {
     if (!seed) throw new Error(`journal has no seed for ${id}`); let run = seed; for (const event of events) run = reduce(run, event); return assertRun(run);
   }
   async list() { try { return (await readdir(this.dir)).filter((name) => name.endsWith(".json")).map((name) => name.slice(0, -5)); } catch { return []; } }
-  async activeForTask(taskKey) { for (const id of await this.list()) { const run = await this.load(id); if (run.taskKey === taskKey && !["done", "cancelled", "failed"].includes(run.status)) return run; } }
+  async activeForTask(taskKey) { for (const id of await this.list()) { const run = await this.load(id); if (run.taskKey === taskKey && !terminalClaimOwners.has(run.status)) return run; } }
 }
 
 export class Lease {

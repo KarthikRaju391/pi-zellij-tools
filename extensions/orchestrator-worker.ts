@@ -10,12 +10,13 @@ const pathFrom = (input: unknown) => typeof (input as { path?: unknown })?.path 
 export default function orchestratorWorker(pi: ExtensionAPI) {
   let bound: Binding | undefined;
   pi.registerCommand("orchestrator-bind", { description: "Controller-only binding", handler: async (args, ctx) => {
-    const [node, generation, token, role, encoded, ...extra] = args.trim().split(/\s+/);
+    bound = undefined;
     try {
+      const [node, generation, token, role, encoded, ...extra] = args.trim().split(/\s+/);
       const scope = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
       if (extra.length || !/^[\w.-]{1,100}$/.test(node) || !/^\d+$/.test(generation) || !/^[\w-]{8,128}$/.test(token) || !["investigator", "verifier", "reviewer", "writer"].includes(role) || !Array.isArray(scope.roots) || !scope.roots.every((x) => typeof x === "string" && resolve(x) === resolve(ctx.cwd)) || !Array.isArray(scope.paths) || !scope.paths.every((x) => typeof x === "string" && x && !x.startsWith("/") && !x.split("/").includes(".."))) throw new Error("invalid binding");
       bound = { node, generation: Number(generation), token, role: role as Binding["role"], roots: scope.roots.map((root: string) => resolve(root)), paths: scope.paths };
-    } catch { ctx.ui.notify("Invalid orchestrator binding", "error"); }
+    } catch (error) { ctx.ui.notify("Invalid orchestrator binding", "error"); throw error; }
   } });
   pi.on("tool_call", (event, ctx) => {
     if (!bound) return { block: true, reason: "worker is not bound" };

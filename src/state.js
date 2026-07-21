@@ -7,6 +7,7 @@ export function validateSpec(input, workflow) {
   const spec = structuredClone(input ?? {});
   const text = (key, value) => { if (typeof value !== "string" || !value.trim()) throw new Error(`spec.${key} is required`); return value; };
   text("taskKey", spec.taskKey); text("objective", spec.objective); text("cwd", spec.cwd);
+  if (["model", "provider", "thinking"].some((key) => Object.hasOwn(spec, key))) throw new Error("worker routing is fixed by role");
   if (!spec.cwd.startsWith("/")) throw new Error("spec.cwd must be an absolute dedicated worktree");
   if (workflow === "fix-to-pr") { text("remote", spec.remote); text("base", spec.base); text("branch", spec.branch); }
   if (workflow === "fix-to-pr" && (!Array.isArray(spec.paths) || !spec.paths.length || spec.paths.some((p) => typeof p !== "string" || !p || p.startsWith("/") || p.split("/").includes("..")))) throw new Error("spec.paths must be non-empty relative paths");
@@ -19,8 +20,8 @@ export function validateSpec(input, workflow) {
   spec.paths ??= []; return Object.freeze(spec);
 }
 
-export function newRun({ id = randomUUID(), workflow, spec, model = "openai-codex/gpt-5.6-terra" }) {
-  return { id, workflow, spec, taskKey: spec.taskKey, cwd: spec.cwd, model, status: "running", generation: 1, lease: 1,
+export function newRun({ id = randomUUID(), workflow, spec }) {
+  return { id, workflow, spec, taskKey: spec.taskKey, cwd: spec.cwd, status: "running", generation: 1, lease: 1,
     nodes: {}, seen: [], effects: {}, reviewRounds: 0, createdAt: Date.now(), updatedAt: Date.now() };
 }
 const current = (run, event) => event.generation === run.generation && event.lease === run.lease;
@@ -46,7 +47,7 @@ export function reduce(run, event) {
       if (node.role !== "writer" && node.attempts === 0) return { ...next, nodes: { ...next.nodes, [event.node]: { ...node, attempts: 1, status: "retry" } } };
       return { ...next, status: "waiting-human", reason: node.role === "writer" ? "writer-interrupted" : "read-only-interrupted" };
     }
-    case "effect-started": return { ...next, effects: { ...next.effects, [event.effect]: { status: "started", kind: event.kind, beforeHead: event.beforeHead, attempts: (next.effects[event.effect]?.attempts ?? 0) + 1 } } };
+    case "effect-started": return { ...next, effects: { ...next.effects, [event.effect]: { status: "started", kind: event.kind, beforeHead: event.beforeHead, approvedHead: event.approvedHead, attempts: (next.effects[event.effect]?.attempts ?? 0) + 1 } } };
     case "effect-finished": return { ...next, effects: { ...next.effects, [event.effect]: { ...next.effects[event.effect], status: event.outcome, kind: event.kind, result: event.result } } };
     case "review-changes": {
       if (next.reviewRounds >= next.spec.maxReviewRounds) return { ...next, status: "waiting-human", reason: "review-round-limit" };
