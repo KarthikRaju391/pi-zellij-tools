@@ -11,6 +11,7 @@ export class Controller {
   constructor({ store = new Store(), workers, effectsFor = (spec) => new GitEffects({ spec }), token = () => randomUUID() }) { this.store = store; this.workers = workers; this.effectsFor = effectsFor; this.token = token; this.queue = Promise.resolve(); }
   enqueue(fn) { this.queue = this.queue.then(fn, fn); return this.queue; }
   async start({ workflow: name, spec, model }) {
+    if (model) throw new Error("per-run model override is not supported");
     let validated = validateSpec(spec, name); validated = Object.freeze({ ...validated, cwd: await realpath(validated.cwd).catch(() => validated.cwd) }); const active = await this.store.activeForTask(validated.taskKey); if (active) throw new Error(`active run already owns taskKey ${validated.taskKey}: ${active.id}`);
     const draft = newRun({ workflow: name, spec: validated, model }); await this.store.claim(validated.taskKey, validated.cwd, draft.id); try { this.effects = this.effectsFor(validated); if (name === "fix-to-pr") await this.effects.preflight?.(); this.run = await this.store.create(draft); return this.acquire(); } catch (error) { await this.store.releaseClaim(validated.taskKey, validated.cwd); throw error; }
   }
@@ -47,10 +48,10 @@ export class Controller {
   async _onWorkerEvent(stage, event, worker) {
     if (TERMINAL.has(this.run.status)) return;
     if (event.type === "stderr") return; // pi-pool emits account/status diagnostics on stderr.
-    if (["process_exit", "protocol_error"].includes(event.type)) return this.event(this.fenced("recovery-wait", { reason: `worker-${stage.id}-${event.type}` }));
+    if (["process_exit", "protocol_error"].includes(event.type) && this.run.nodes[stage.id]?.status === "running") return this.event(this.fenced("recovery-wait", { reason: `worker-${stage.id}-${event.type}` }));
     if (event.type === "tool_execution_end" && event.toolName === "orchestrator_report" && !event.isError) {
       const report = event.result?.details; if (report?.node !== stage.id || report.generation !== this.run.generation || report.token !== worker.token || report.role !== stage.role) return;
-      worker.busy = false; let head; try { head = await this.effects.head(); } catch { return this.event(this.fenced("recovery-wait", { reason: "cannot-validate-head" })); }
+      worker.busy = false; let head; if (stage.role === "writer" || stage.role === "reviewer" || stage.exactHeadOf) try { head = await this.effects.head(); } catch { return this.event(this.fenced("recovery-wait", { reason: "cannot-validate-head" })); }
       if (stage.role === "reviewer") {
         const expected = this.run.nodes[stage.id]?.head; if (!expected || expected !== head) return this.event(this.fenced("recovery-wait", { reason: "stale-review-head" }));
         if (report.outcome === "changes_requested") { await this.event(this.fenced("review-changes", { node: stage.id, feedback: report.feedback || report.summary })); await this.pump(); return this.run; }
