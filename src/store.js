@@ -11,9 +11,9 @@ const privateDir = async (dir) => { await mkdir(dir, { recursive: true, mode: 0o
 export class Store {
   constructor(dir = defaultStateDir()) { this.dir = dir; }
   async init() { await privateDir(this.dir); await privateDir(join(this.dir, "workers")); }
-  claimFile(taskKey, cwd) { return join(this.dir, `claim-${createHash("sha256").update(`${taskKey}\0${cwd}`).digest("hex")}.lock`); }
-  async claim(taskKey, cwd, runId) { await this.init(); const handle = await open(this.claimFile(taskKey, cwd), "wx", 0o600); try { await handle.writeFile(runId); await handle.sync(); } finally { await handle.close(); } }
-  async releaseClaim(taskKey, cwd) { await unlink(this.claimFile(taskKey, cwd)).catch(() => {}); }
+  claimFiles(taskKey, cwd) { const digest = (value) => createHash("sha256").update(value).digest("hex"); return [join(this.dir, `claim-task-${digest(taskKey)}.lock`), join(this.dir, `claim-cwd-${digest(cwd)}.lock`)]; }
+  async claim(taskKey, cwd, runId) { await this.init(); const claimed = []; try { for (const file of this.claimFiles(taskKey, cwd)) { const handle = await open(file, "wx", 0o600); await handle.writeFile(runId); await handle.sync(); await handle.close(); claimed.push(file); } } catch (error) { await Promise.all(claimed.map((file) => unlink(file).catch(() => {}))); throw error; } }
+  async releaseClaim(taskKey, cwd) { await Promise.all(this.claimFiles(taskKey, cwd).map((file) => unlink(file).catch(() => {}))); }
   async create(run) {
     await this.init(); const { journal } = files(this.dir, run.id);
     const handle = await open(journal, "wx", 0o600);

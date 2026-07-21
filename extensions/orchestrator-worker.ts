@@ -5,10 +5,10 @@ import { resolve } from "node:path";
 import { guardPath } from "../src/path-policy.js";
 
 type Binding = { node: string; generation: number; token: string; role: "investigator" | "verifier" | "reviewer" | "writer"; roots: string[]; paths: string[] };
-let bound: Binding | undefined;
 const pathFrom = (input: unknown) => typeof (input as { path?: unknown })?.path === "string" ? (input as { path: string }).path : undefined;
 
 export default function orchestratorWorker(pi: ExtensionAPI) {
+  let bound: Binding | undefined;
   pi.registerCommand("orchestrator-bind", { description: "Controller-only binding", handler: async (args, ctx) => {
     const [node, generation, token, role, encoded, ...extra] = args.trim().split(/\s+/);
     try {

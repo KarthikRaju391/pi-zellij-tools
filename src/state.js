@@ -46,7 +46,7 @@ export function reduce(run, event) {
       if (node.role !== "writer" && node.attempts === 0) return { ...next, nodes: { ...next.nodes, [event.node]: { ...node, attempts: 1, status: "retry" } } };
       return { ...next, status: "waiting-human", reason: node.role === "writer" ? "writer-interrupted" : "read-only-interrupted" };
     }
-    case "effect-started": return { ...next, effects: { ...next.effects, [event.effect]: { status: "started", kind: event.kind, attempts: (next.effects[event.effect]?.attempts ?? 0) + 1 } } };
+    case "effect-started": return { ...next, effects: { ...next.effects, [event.effect]: { status: "started", kind: event.kind, beforeHead: event.beforeHead, attempts: (next.effects[event.effect]?.attempts ?? 0) + 1 } } };
     case "effect-finished": return { ...next, effects: { ...next.effects, [event.effect]: { ...next.effects[event.effect], status: event.outcome, kind: event.kind, result: event.result } } };
     case "review-changes": {
       if (next.reviewRounds >= next.spec.maxReviewRounds) return { ...next, status: "waiting-human", reason: "review-round-limit" };

@@ -8,7 +8,7 @@ export const WORKFLOWS = Object.freeze({
     { type: "agent", id: "review-head", role: "reviewer", exactHeadOf: "rebase" }, { type: "effect", id: "pr-reconcile", effect: "reconcile-pr" }, { type: "effect", id: "publish", effect: "publish-pr" },
   ],
 });
-export function workflow(name) { if (!WORKFLOWS[name]) throw new Error(`unknown trusted workflow: ${name}`); return structuredClone(WORKFLOWS[name]); }
+export function workflow(name) { if (!WORKFLOWS[name]) throw new Error(`unknown trusted workflow: ${name}`); const plan = structuredClone(WORKFLOWS[name]); validate(plan); return plan; }
 export function validate(plan) {
   let writers = 0; const ids = new Set();
   for (const item of plan.flatMap((x) => x.type === "parallel" ? x.nodes : [x])) { if (item.type !== "agent") continue; if (!roles.has(item.role) || ids.has(item.id)) throw new Error("invalid agent"); ids.add(item.id); writers += item.role === "writer"; }
