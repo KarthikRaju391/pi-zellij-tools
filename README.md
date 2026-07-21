@@ -1,16 +1,13 @@
 # pi-zellij-tools
 
-Pi package for running and tracking long-lived Zellij background tasks.
+Pi package for running and tracking long-lived Zellij background tasks, plus a small durable control plane for new Pi runs.
 
 Includes:
 
 - `zellij_run`, `zellij_subscribe`, `zellij_wait`, `zellij_list`, `zellij_snapshot`, `zellij_close`, `zellij_tasks`
 - Persistent task state in `~/.pi/agent/state/zellij-tasks.json`
-- Completion events via `customType: "zellij-task-event"`
-- Auto-triggered agent continuation when background tasks exit
-- Collapsed/expanded Zellij task dashboard (`alt+z` or `/zellij-dashboard`)
-- Cleanup command (`/zellij-cleanup active|stopped|all`)
-- Zellij skill instructions for Pi
+- Completion events, dashboard, cleanup commands, and Zellij skill instructions
+- `pi-orch`: append-only, controller-owned Pi orchestration
 
 ## Install
 
@@ -26,29 +23,29 @@ pi -e git:github.com/KarthikRaju391/pi-zellij-tools
 
 Then restart Pi or run `/reload`.
 
-## Usage
+## Zellij usage
 
 ```ts
-zellij_run({
-  command: "npm run dev",
-  name: "dev-server"
-})
+zellij_run({ command: "npm run dev", name: "dev-server" })
 ```
 
-Detached tasks open in their own Zellij tab by default. When a command exits, Pi receives a `zellij-task-event` and the agent can continue automatically.
+Dashboard: `/zellij-dashboard toggle|expand|collapse`. Cleanup: `/zellij-cleanup active|stopped|all`.
 
-Dashboard:
+## Orchestration
 
-```text
-/zellij-dashboard toggle
-/zellij-dashboard expand
-/zellij-dashboard collapse
+```sh
+pi-orch run fix-to-pr --spec task.json
+pi-orch status <run-id>
+pi-orch resume <run-id>
+pi-orch cancel <run-id>
+pi-orch approve <run-id>
+pi-orch reconcile <run-id> <target> <decision>
 ```
 
-Cleanup:
+For `fix-to-pr`, `task.json` supplies a stable task key, dedicated clean worktree, scoped paths, base/remote/branch, instructions capped at 8,000 characters, a non-empty explicitly trusted executable/argv check manifest, and explicit edit/PR authorization. Read-only workflows require only task identity, objective, and cwd. State is append-only JSONL plus an atomic snapshot in `~/.pi/orchestrator` (override with `--state-dir` or `PI_ORCH_STATE_DIR`).
 
-```text
-/zellij-cleanup active
-/zellij-cleanup stopped
-/zellij-cleanup all
-```
+Workers are `pi-pool --mode rpc` processes, not panes or transcripts. They load only `extensions/orchestrator-worker.ts`, communicate with strict LF JSONL, and must finish through its terminating `orchestrator_report` tool. Zellij is not part of control flow.
+
+`cancel` writes a private durable request for that run. Its lease owner journals `cancelling` before stopping workers, waits for every child to exit, then journals terminal cancellation and releases claims; a shutdown timeout retains the lease, claims, and request for retry. If no owner is alive, the command safely takes the lease and consumes the request itself. Foreground runs handle SIGINT/SIGTERM through the same path. `approve` is deliberately narrow: it can retry only interrupted/failed read-only nodes through the normal structured-report workflow. It refuses writer or effect uncertainty, dirty fix worktrees, stale reviewer HEADs, and states that would skip a later gate.
+
+Trusted workflows are code-only: `investigate-report`, `read-only-verify`, and `fix-to-pr`. The latter permits one writer, has the controller stage only spec-scoped paths, rechecks after rebase, requires exact-HEAD reviewer approval with bounded feedback loops, reconciles existing PRs before creation, opens then reads back an unmerged PR, and never merges. Git/PR actions use fixed executable/argv operations; the explicitly trusted check manifest may run its listed programs. Merge, deploy, production, data, migration, and messaging effects are not in the effect API. CI remains `pending` until observed separately.
