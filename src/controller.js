@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { newRun, idFor, TERMINAL, validateSpec } from "./state.js";
 import { Lease, Store } from "./store.js";
+import { roleRoute } from "./worker.js";
 import { Effect, GitEffects } from "./effects.js";
 import { workflow } from "./workflows.js";
 
@@ -13,7 +14,7 @@ export class Controller {
     let validated = validateSpec(spec, name); validated = Object.freeze({ ...validated, cwd: await realpath(validated.cwd).catch(() => validated.cwd) }); const active = await this.store.activeForTask(validated.taskKey); if (active) throw new Error(`active run already owns taskKey ${validated.taskKey}: ${active.id}`);
     const draft = newRun({ workflow: name, spec: validated, model }); await this.store.claim(validated.taskKey, validated.cwd, draft.id); try { this.effects = this.effectsFor(validated); if (name === "fix-to-pr") await this.effects.preflight?.(); this.run = await this.store.create(draft); return this.acquire(); } catch (error) { await this.store.releaseClaim(validated.taskKey, validated.cwd); throw error; }
   }
-  async resume(id) { this.run = await this.store.load(id); this.effects = this.effectsFor(this.run.spec); await this.acquire(); return this.enqueue(() => this.recover()); }
+  async resume(id) { this.run = await this.store.load(id); this.effects = this.effectsFor(this.run.spec); if (this.run.workflow === "fix-to-pr") await this.effects.preflight?.(); await this.acquire(); return this.enqueue(() => this.recover()); }
   async acquire() { this.plan = workflow(this.run.workflow); this.lease = new Lease(this.store.dir, this.run.id); const lock = await this.lease.acquire(this.run.generation + 1); return this.event({ id: idFor("lease", lock), type: "lease-acquired", generation: lock.generation, lease: lock.lease }); }
   async close() { this.workers.shutdown?.(); await this.lease?.release(); if (this.run && ["done", "cancelled", "failed"].includes(this.run.status)) await this.store.releaseClaim(this.run.taskKey, this.run.cwd); }
   fenced(type, extra = {}) { return { id: idFor("event", { run: this.run.id, generation: this.run.generation, lease: this.run.lease, type, extra }), type, generation: this.run.generation, lease: this.run.lease, ...extra }; }
@@ -39,7 +40,7 @@ export class Controller {
     const old = this.run.nodes[stage.id]; const policy = stage.role === "writer" ? "write" : "read-only"; const head = stage.exactHeadOf ? this.run.nodes[stage.exactHeadOf]?.head ?? this.run.effects[stage.exactHeadOf]?.result?.head : undefined;
     let worker = this.workers.reusable({ runId: this.run.id, role: stage.role, cwd: this.run.cwd, policy, model: this.run.model, stage: stage.id });
     if (!worker) worker = this.workers.start({ id: idFor("worker", { run: this.run.id, stage: stage.id }), runId: this.run.id, role: stage.role, cwd: this.run.cwd, policy, model: this.run.model, stage: stage.id }, (event, record) => { void this.onWorkerEvent(stage, event, record); });
-    worker.busy = true; worker.idle = false; worker.token = this.token(); await this.event(this.fenced("node-started", { node: stage.id, role: stage.role, worker: worker.id, sessionDir: worker.sessionDir, pid: worker.child.pid, head, attempt: old?.attempts ?? 0 }));
+    worker.busy = true; worker.idle = false; worker.token = this.token(); await this.event(this.fenced("node-started", { node: stage.id, role: stage.role, worker: worker.id, sessionDir: worker.sessionDir, pid: worker.child.pid, route: roleRoute[stage.role], policy, head, attempt: old?.attempts ?? 0 }));
     try { await this.workers.bindAndPrompt(worker, stage.id, this.run.generation, worker.token, this.prompt(stage), this.run.spec); } catch (error) { worker.busy = false; await this.event(this.fenced("recovery-wait", { reason: `rpc-bind-failed-${stage.id}: ${String(error).slice(0, 300)}` })); } return this.run;
   }
   onWorkerEvent(stage, event, worker) { return this.enqueue(() => this._onWorkerEvent(stage, event, worker)); }
@@ -61,7 +62,7 @@ export class Controller {
     if (event.type === "agent_settled") { worker.busy = false; worker.idle = true; const node = this.run.nodes[stage.id]; if (node?.status === "running") { await this.event(this.fenced("agent-settled", { node: stage.id, attempt: node.attempts })); await this.pump(); if (TERMINAL.has(this.run.status)) await this.close(); return this.run; } }
   }
   async effect(stage) {
-    const kind = Object.values(Effect).includes(stage.effect) ? stage.effect : Effect.CHECKS; const old = this.run.effects[stage.id];
+    const kind = Object.values(Effect).includes(stage.effect) ? stage.effect : Effect.CHECKS; if ([Effect.RECONCILE_PR, Effect.PUBLISH_PR].includes(kind)) { const approved = this.run.nodes["review-head"]?.head; const current = await this.effects.head(); if (!approved || current !== approved) return this.event(this.fenced("recovery-wait", { reason: "final-review-head-stale" })); } const old = this.run.effects[stage.id];
     if (old?.status === "started" && [Effect.COMMIT, Effect.REBASE, Effect.PUBLISH_PR].includes(old.kind)) return this.event(this.fenced("recovery-wait", { reason: `interrupted-${old.kind}` }));
     const attempt = (old?.attempts ?? 0) + 1; let beforeHead; try { beforeHead = await this.effects.head(); } catch {} await this.event(this.fenced("effect-started", { effect: stage.id, kind, attempt, beforeHead }));
     try { const result = await this.effects.run(kind); await this.event(this.fenced("effect-finished", { effect: stage.id, kind, outcome: "ok", result, attempt })); if (kind === Effect.RECONCILE_PR && result.existing) return this.event(this.fenced("complete", { pr: result.existing })); if (kind === Effect.PUBLISH_PR) await this.event(this.fenced("complete", { pr: result.pr })); }
@@ -71,7 +72,7 @@ export class Controller {
   async reconcile(target, decision) {
     if (!Object.hasOwn(this.run.nodes, target) && !Object.hasOwn(this.run.effects, target)) throw new Error("reconciliation target is not persisted");
     if (!["abandon", "confirmed-applied", "confirmed-not-applied"].includes(decision)) throw new Error("specific reconciliation decision required");
-    return this.enqueue(async () => { let result; let kind; if (decision === "confirmed-applied") { kind = this.run.effects[target]?.kind; if (!kind) throw new Error("interrupted agents require a recovered structured report, not confirmed-applied"); if (!this.effects.prove) throw new Error("exact read-only proof is unavailable"); result = await this.effects.prove(kind, this.run.effects[target]); if (!result || (kind !== Effect.PUBLISH_PR && !result.head) || (kind === Effect.PUBLISH_PR && !result.pr)) throw new Error("exact proof did not establish outcome"); } await this.event(this.fenced("reconcile", { target, decision, result })); if (kind === Effect.PUBLISH_PR && decision === "confirmed-applied") await this.event(this.fenced("complete", { pr: result.pr })); if (this.run.status === "running") await this.pump(); return this.run; });
+    return this.enqueue(async () => { let result; let kind; if (decision === "confirmed-applied") { kind = this.run.effects[target]?.kind; if (kind !== Effect.PUBLISH_PR) throw new Error("confirmed-applied is allowed only for exact open PR proof"); if (!this.effects.prove) throw new Error("exact read-only proof is unavailable"); result = await this.effects.prove(kind, this.run.effects[target]); if (!result || (kind !== Effect.PUBLISH_PR && !result.head) || (kind === Effect.PUBLISH_PR && !result.pr)) throw new Error("exact proof did not establish outcome"); } await this.event(this.fenced("reconcile", { target, decision, result })); if (kind === Effect.PUBLISH_PR && decision === "confirmed-applied") await this.event(this.fenced("complete", { pr: result.pr })); if (this.run.status === "running") await this.pump(); return this.run; });
   }
   async cancel(reason) { return this.enqueue(() => this.event(this.fenced("cancel", { reason }))); }
 }

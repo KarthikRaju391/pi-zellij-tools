@@ -35,7 +35,7 @@ export function reduce(run, event) {
     case "node-started": {
       if (event.role === "writer" && Object.values(next.nodes).some((n) => n.role === "writer" && n.status === "running")) return { ...next, status: "waiting-human", reason: "second-writer-blocked" };
       const old = next.nodes[event.node];
-      return { ...next, nodes: { ...next.nodes, [event.node]: { role: event.role, status: "running", attempts: event.attempt ?? old?.attempts ?? 0, worker: event.worker, sessionDir: event.sessionDir, head: event.head } } };
+      return { ...next, nodes: { ...next.nodes, [event.node]: { role: event.role, status: "running", attempts: event.attempt ?? old?.attempts ?? 0, worker: event.worker, pid: event.pid, route: event.route, policy: event.policy, sessionDir: event.sessionDir, head: event.head } } };
     }
     case "report": {
       const node = next.nodes[event.node]; if (!node || node.status !== "running" || node.role !== event.role) return next;

@@ -10,8 +10,6 @@ export const WORKFLOWS = Object.freeze({
 });
 export function workflow(name) { if (!WORKFLOWS[name]) throw new Error(`unknown trusted workflow: ${name}`); const plan = structuredClone(WORKFLOWS[name]); validate(plan); return plan; }
 export function validate(plan) {
-  let writers = 0; const ids = new Set();
-  for (const item of plan.flatMap((x) => x.type === "parallel" ? x.nodes : [x])) { if (item.type !== "agent") continue; if (!roles.has(item.role) || ids.has(item.id)) throw new Error("invalid agent"); ids.add(item.id); writers += item.role === "writer"; }
-  if (writers > 1) throw new Error("workflow has more than one writer"); return true;
+  let writers = 0; const ids = new Set(); const visit = (item) => { if (item.type === "parallel") { if (!Array.isArray(item.nodes) || item.nodes.length < 2 || item.nodes.length > 3) throw new Error("invalid parallel"); item.nodes.forEach(visit); return; } if (item.type === "agent") { if (!roles.has(item.role) || !item.id || ids.has(item.id)) throw new Error("invalid agent"); ids.add(item.id); writers += item.role === "writer"; return; } if (item.type === "effect" && item.id && ["commit", "checks", "rebase", "reconcile-pr", "publish-pr"].includes(item.effect)) { if (ids.has(item.id)) throw new Error("duplicate id"); ids.add(item.id); return; } throw new Error("unknown workflow node"); }; plan.forEach(visit); if (writers > 1) throw new Error("workflow has more than one writer"); return true;
 }
 export const roleTools = Object.freeze({ investigator: ["read", "grep", "find", "ls", "orchestrator_report"], verifier: ["read", "grep", "find", "ls", "orchestrator_report"], reviewer: ["read", "grep", "find", "ls", "orchestrator_report"], writer: ["read", "edit", "write", "grep", "find", "ls", "orchestrator_report"] });
