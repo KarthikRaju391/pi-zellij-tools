@@ -196,6 +196,7 @@ export class Controller {
     if (this.run.status !== "cancelling") await this.event(this.fenced("cancelling", { reason, requestId }));
     try { await this.workers?.shutdown?.(); }
     catch (error) { this.shutdownError = error; return this.run; }
+    if (await this.store.workersAlive(this.run)) return this.run;
     return this.event(this.fenced("cancel", { reason, requestId }));
   }
   async cancel(reason) { return this.requestCancellation(this.run.id, reason); }

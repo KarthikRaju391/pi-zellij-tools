@@ -85,6 +85,16 @@ test("a shutdown timeout retains cancelling state and claims until a late exit r
   assert.equal(ctl.run.status, "cancelled"); assert.equal(await store.readCancel(ctl.run.id), undefined); assert.equal(request.runId, ctl.run.id);
 });
 
+test("cancellation waits for detached group descendants after the leader exits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cancel-group-")); let groupAlive = true; const store = new Store(dir, { workerAlive: async () => groupAlive }); const { adapter, started } = fakeWorkers(dir);
+  const ctl = new Controller({ store, workers: adapter, effectsFor: () => effects, cancelPollMs: 10000 }); await ctl.start({ workflow: "investigate-report", spec: readSpec({ taskKey: "group-cancel" }) }); await ctl.pump();
+  const request = await store.requestCancel(ctl.run.id, "stop"); await ctl.pollCancelRequest();
+  assert.equal(started[0].child.killed, true); assert.equal(ctl.run.status, "cancelling"); assert.equal((await store.load(ctl.run.id)).status, "cancelling"); await assert.rejects(store.claim("replacement", ctl.run.cwd, "replacement"), /active claim/);
+  groupAlive = false; await ctl.pollCancelRequest();
+  assert.equal(ctl.run.status, "cancelled"); assert.equal(await store.readCancel(ctl.run.id), undefined); assert.equal(request.runId, ctl.run.id);
+  await store.claim("replacement", ctl.run.cwd, "replacement");
+});
+
 test("completion stays closing across a controller crash until its persisted worker group exits", async () => {
   const dir = await mkdtemp(join(tmpdir(), "done-close-")); let alive = true; const store = new Store(dir, { workerAlive: async () => alive }); const { adapter, started } = fakeWorkers(dir, [], { autoExit: false, shutdownTimeout: 10 });
   const ctl = new Controller({ store, workers: adapter, effectsFor: () => effects }); await ctl.start({ workflow: "investigate-report", spec: readSpec({ taskKey: "done-close" }) }); await ctl.pump(); report(ctl, started[0], "investigate");
