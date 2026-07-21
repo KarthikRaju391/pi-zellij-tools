@@ -1,11 +1,13 @@
 {
   "name": "pi-zellij-tools",
-  "version": "0.1.0",
-  "description": "Pi package with Zellij background task tools, task-state widget, completion events, and Zellij skill instructions.",
-  "keywords": ["pi-package", "pi", "zellij", "coding-agent"],
+  "version": "0.2.0",
+  "description": "Pi Zellij tools and a small durable orchestration control plane.",
+  "keywords": ["pi-package", "pi", "zellij", "coding-agent", "orchestrator"],
   "license": "MIT",
   "author": "KarthikRaju391",
   "type": "module",
+  "bin": { "pi-orch": "./src/cli.js" },
+  "scripts": { "test": "node --test", "check": "node --check src/*.js" },
   "pi": {
     "extensions": ["./extensions"],
     "skills": ["./skills"]
