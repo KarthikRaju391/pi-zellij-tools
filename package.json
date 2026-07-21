@@ -7,7 +7,7 @@
   "author": "KarthikRaju391",
   "type": "module",
   "bin": { "pi-orch": "./src/cli.js" },
-  "scripts": { "test": "node --test", "check": "node --check src/*.js" },
+  "scripts": { "test": "node --test", "check": "node --check src/*.js && node scripts/check-worker.mjs" },
   "pi": {
     "extensions": ["./extensions"],
     "skills": ["./skills"]

@@ -34,16 +34,15 @@ Dashboard: `/zellij-dashboard toggle|expand|collapse`. Cleanup: `/zellij-cleanup
 ## Orchestration
 
 ```sh
-pi-orch run investigate-report
-pi-orch run fix-to-pr --authorize-edits --cwd /repo
+pi-orch run fix-to-pr --spec task.json
 pi-orch status <run-id>
 pi-orch resume <run-id>
 pi-orch cancel <run-id>
-pi-orch approve <run-id>
+pi-orch reconcile <run-id> <target> <decision>
 ```
 
-State is append-only JSONL plus an atomic snapshot in `~/.pi/orchestrator` (override with `--state-dir` or `PI_ORCH_STATE_DIR`). One controller lease and fenced generation/lease event IDs prevent stale controllers from changing a run. The controller only owns runs it creates.
+`task.json` supplies a stable task key, dedicated clean worktree, scoped paths, base/remote/branch, bounded instructions, non-empty check manifest, and explicit edit/PR authorization. State is append-only JSONL plus an atomic snapshot in `~/.pi/orchestrator` (override with `--state-dir` or `PI_ORCH_STATE_DIR`).
 
 Workers are `pi-pool --mode rpc` processes, not panes or transcripts. They load only `extensions/orchestrator-worker.ts`, communicate with strict LF JSONL, and must finish through its terminating `orchestrator_report` tool. Zellij is not part of control flow.
 
-Trusted workflows are code-only: `investigate-report`, `read-only-verify`, and `fix-to-pr`. The latter needs `--authorize-edits`, permits one writer, has the controller commit the clean task worktree, rechecks after rebase, requires an exact-HEAD independent reviewer, opens then reads back an unmerged PR, and never merges. Git/PR actions use fixed executable/argv operations; merge, deploy, production, data, migration, messaging, and arbitrary shell effects do not exist in the effect API. CI remains `pending` until observed separately.
+Trusted workflows are code-only: `investigate-report`, `read-only-verify`, and `fix-to-pr`. The latter permits one writer, has the controller stage only spec-scoped paths, rechecks after rebase, requires exact-HEAD reviewer approval with bounded feedback loops, reconciles existing PRs before creation, opens then reads back an unmerged PR, and never merges. Git/PR actions use fixed executable/argv operations; merge, deploy, production, data, migration, messaging, and arbitrary shell effects do not exist in the effect API. CI remains `pending` until observed separately.
