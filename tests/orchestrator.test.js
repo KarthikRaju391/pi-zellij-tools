@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { newRun, reduce, validateSpec } from "../src/state.js";
 import { Lease, Store } from "../src/store.js";
-import { WorkerAdapter, LfJsonl } from "../src/worker.js";
+import { WorkerAdapter, LfJsonl, roleRoute } from "../src/worker.js";
+import { guardPath } from "../src/path-policy.js";
 import { Controller } from "../src/controller.js";
 import { Effect } from "../src/effects.js";
 
@@ -20,7 +21,7 @@ class FakeEffects {
 }
 function workers(dir) {
   const spawned = []; const adapter = new WorkerAdapter({ stateDir: dir, spawnProcess: () => ({ stdin: { write() {} }, stdout: new PassThrough(), stderr: new PassThrough(), kill() {} }) });
-  const original = adapter.start.bind(adapter); adapter.start = (...args) => { const worker = original(...args); spawned.push(worker); return worker; }; return { adapter, spawned };
+  const original = adapter.start.bind(adapter); adapter.start = (...args) => { const worker = original(...args); spawned.push(worker); return worker; }; adapter.bindAndPrompt = async () => ({ success: true }); return { adapter, spawned };
 }
 async function ready(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise((r) => setTimeout(r, 2)); } throw new Error("timed out"); }
 function report(ctl, worker, node, outcome, extra = {}) { worker.child.stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "orchestrator_report", isError: false, result: { details: { node, generation: ctl.run.generation, token: worker.token, role: worker.role, outcome, summary: outcome, ...extra } } })}\n`); }

@@ -1,5 +1,5 @@
 import { chmod, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { assertRun, reduce } from "./state.js";
 
@@ -11,6 +11,9 @@ const privateDir = async (dir) => { await mkdir(dir, { recursive: true, mode: 0o
 export class Store {
   constructor(dir = defaultStateDir()) { this.dir = dir; }
   async init() { await privateDir(this.dir); await privateDir(join(this.dir, "workers")); }
+  claimFile(taskKey, cwd) { return join(this.dir, `claim-${createHash("sha256").update(`${taskKey}\0${cwd}`).digest("hex")}.lock`); }
+  async claim(taskKey, cwd, runId) { await this.init(); const handle = await open(this.claimFile(taskKey, cwd), "wx", 0o600); try { await handle.writeFile(runId); await handle.sync(); } finally { await handle.close(); } }
+  async releaseClaim(taskKey, cwd) { await unlink(this.claimFile(taskKey, cwd)).catch(() => {}); }
   async create(run) {
     await this.init(); const { journal } = files(this.dir, run.id);
     const handle = await open(journal, "wx", 0o600);

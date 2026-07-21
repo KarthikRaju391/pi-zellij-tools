@@ -41,7 +41,7 @@ pi-orch cancel <run-id>
 pi-orch reconcile <run-id> <target> <decision>
 ```
 
-`task.json` supplies a stable task key, dedicated clean worktree, scoped paths, base/remote/branch, bounded instructions, non-empty check manifest, and explicit edit/PR authorization. State is append-only JSONL plus an atomic snapshot in `~/.pi/orchestrator` (override with `--state-dir` or `PI_ORCH_STATE_DIR`).
+For `fix-to-pr`, `task.json` supplies a stable task key, dedicated clean worktree, scoped paths, base/remote/branch, instructions capped at 8,000 characters, a non-empty check manifest, and explicit edit/PR authorization. Read-only workflows require only task identity, objective, and cwd. State is append-only JSONL plus an atomic snapshot in `~/.pi/orchestrator` (override with `--state-dir` or `PI_ORCH_STATE_DIR`).
 
 Workers are `pi-pool --mode rpc` processes, not panes or transcripts. They load only `extensions/orchestrator-worker.ts`, communicate with strict LF JSONL, and must finish through its terminating `orchestrator_report` tool. Zellij is not part of control flow.
 

@@ -6,16 +6,17 @@ export const idFor = (kind, value) => `${kind}-${createHash("sha256").update(JSO
 export function validateSpec(input, workflow) {
   const spec = structuredClone(input ?? {});
   const text = (key, value) => { if (typeof value !== "string" || !value.trim()) throw new Error(`spec.${key} is required`); return value; };
-  text("taskKey", spec.taskKey); text("objective", spec.objective); text("cwd", spec.cwd); text("remote", spec.remote); text("base", spec.base); text("branch", spec.branch);
+  text("taskKey", spec.taskKey); text("objective", spec.objective); text("cwd", spec.cwd);
   if (!spec.cwd.startsWith("/")) throw new Error("spec.cwd must be an absolute dedicated worktree");
-  if (!Array.isArray(spec.paths) || !spec.paths.length || spec.paths.some((p) => typeof p !== "string" || !p || p.startsWith("/") || p.split("/").includes(".."))) throw new Error("spec.paths must be non-empty relative paths");
-  if (!spec.authorization || spec.authorization.edit !== true || spec.authorization.pr !== true) throw new Error("spec requires explicit edit and PR authorization");
+  if (workflow === "fix-to-pr") { text("remote", spec.remote); text("base", spec.base); text("branch", spec.branch); }
+  if (workflow === "fix-to-pr" && (!Array.isArray(spec.paths) || !spec.paths.length || spec.paths.some((p) => typeof p !== "string" || !p || p.startsWith("/") || p.split("/").includes("..")))) throw new Error("spec.paths must be non-empty relative paths");
+  if (workflow === "fix-to-pr" && (!spec.authorization || spec.authorization.edit !== true || spec.authorization.pr !== true)) throw new Error("spec requires explicit edit and PR authorization");
   if (workflow === "fix-to-pr" && (!Array.isArray(spec.checks) || !spec.checks.length || spec.checks.some((check) => !Array.isArray(check) || !check.length || check.some((x) => typeof x !== "string")))) throw new Error("fix-to-pr requires a non-empty check manifest");
-  if (spec.instructions !== undefined && typeof spec.instructions !== "string") throw new Error("spec.instructions must be text");
-  if (spec.instructionsArtifact !== undefined && typeof spec.instructionsArtifact !== "string") throw new Error("spec.instructionsArtifact must be text");
+  if (spec.instructions !== undefined && (typeof spec.instructions !== "string" || spec.instructions.length > 8000)) throw new Error("spec.instructions must be <= 8000 characters");
+  if (spec.instructionsArtifact !== undefined && (typeof spec.instructionsArtifact !== "string" || spec.instructionsArtifact.length > 1000)) throw new Error("spec.instructionsArtifact must be <= 1000 characters");
   spec.maxReviewRounds = Number.isInteger(spec.maxReviewRounds) ? spec.maxReviewRounds : 3;
   if (spec.maxReviewRounds < 1 || spec.maxReviewRounds > 3) throw new Error("spec.maxReviewRounds must be 1..3");
-  return Object.freeze(spec);
+  spec.paths ??= []; return Object.freeze(spec);
 }
 
 export function newRun({ id = randomUUID(), workflow, spec, model = "openai-codex/gpt-5.6-terra" }) {
@@ -49,10 +50,16 @@ export function reduce(run, event) {
     case "effect-finished": return { ...next, effects: { ...next.effects, [event.effect]: { ...next.effects[event.effect], status: event.outcome, kind: event.kind, result: event.result } } };
     case "review-changes": {
       if (next.reviewRounds >= next.spec.maxReviewRounds) return { ...next, status: "waiting-human", reason: "review-round-limit" };
-      return { ...next, reviewRounds: next.reviewRounds + 1, feedback: event.feedback, effects: {}, nodes: { ...next.nodes, write: { ...next.nodes.write, status: "retry", attempts: (next.nodes.write?.attempts ?? 0) + 1 }, [event.node]: { ...next.nodes[event.node], status: "retry" } } };
+      const nodes = Object.fromEntries(Object.entries(next.nodes).map(([id, node]) => [id, node.role === "writer" ? { ...node, status: "retry", attempts: node.attempts + 1 } : { ...node, status: "pending", head: undefined }]));
+      return { ...next, reviewRounds: next.reviewRounds + 1, feedback: event.feedback, effects: {}, nodes };
     }
     case "recovery-wait": return { ...next, status: "waiting-human", reason: event.reason };
-    case "reconcile": return { ...next, status: event.decision === "abandon" ? "failed" : "waiting-human", reason: `reconciled-${event.target}-${event.decision}` };
+    case "reconcile": {
+      if (event.decision === "abandon") return { ...next, status: "failed", reason: `abandoned-${event.target}` };
+      if (event.decision === "confirmed-not-applied") { const effects = { ...next.effects }; if (effects[event.target]) delete effects[event.target]; const nodes = { ...next.nodes }; if (nodes[event.target]) nodes[event.target] = { ...nodes[event.target], status: "retry" }; return { ...next, status: "running", effects, nodes, reason: undefined }; }
+      if (event.decision === "confirmed-applied") { const effects = { ...next.effects }; const nodes = { ...next.nodes }; if (effects[event.target]) effects[event.target] = { ...effects[event.target], status: "ok", result: event.result }; if (nodes[event.target]) nodes[event.target] = { ...nodes[event.target], status: "ok", head: event.result?.head ?? nodes[event.target].head }; return { ...next, status: "running", effects, nodes, reason: undefined }; }
+      return next;
+    }
     case "cancel": return { ...next, status: "cancelled", reason: event.reason ?? "cancelled" };
     case "complete": return { ...next, status: "done", pr: event.pr, ci: "pending" };
     default: throw new Error(`unknown event type: ${event.type}`);
