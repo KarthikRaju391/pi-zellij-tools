@@ -14,7 +14,7 @@ function fakeChild(responder) {
   child.pid = Math.floor(Math.random() * 100000) + 100;
   child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.writes = []; child.killed = false;
   child.stdin = { write(line) { const message = JSON.parse(line); child.writes.push(message); responder?.(message, child); return true; } };
-  child.kill = () => { child.killed = true; };
+  child.kill = () => { child.killed = true; child.emit("exit", 0, "SIGTERM"); };
   return child;
 }
 

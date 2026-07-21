@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +13,7 @@ import { guardPath } from "../src/path-policy.js";
 import { WorkerAdapter, roleRoute } from "../src/worker.js";
 const spec = (x = {}) => ({ taskKey: `t-${Math.random()}`, objective: "change", cwd: "/work", remote: "origin", base: "main", branch: "topic", paths: ["src"], checks: [["node", "--test"]], authorization: { edit: true, pr: true }, ...x });
 class Effects { constructor(s) { this.spec = s; this.current = "h1"; this.calls = []; } async preflight() {} async head() { return this.current; } async prove(k) { return k === Effect.PUBLISH_PR ? { pr: "u" } : { head: this.current }; } async run(k) { this.calls.push(k); if (k === Effect.COMMIT) return { head: this.current }; if (k === Effect.REBASE) { this.current = "h2"; return { head: this.current }; } if (k === Effect.RECONCILE_PR) return { existing: null }; if (k === Effect.PUBLISH_PR) return { pr: "u" }; return { checked: 1 }; } }
-function workers(dir) { const started=[]; const a = new WorkerAdapter({ stateDir: dir, spawnProcess: () => ({ stdin:{write(){}},stdout:new PassThrough(),stderr:new PassThrough(),kill(){} }) }); const start=a.start.bind(a); a.start=(...x)=>{const w=start(...x);started.push(w);return w;}; a.bindAndPrompt=async()=>({success:true}); return {a,started}; }
+function workers(dir) { const started=[]; const a = new WorkerAdapter({ stateDir: dir, spawnProcess: () => { const child = new EventEmitter(); Object.assign(child, { stdin:{write(){}}, stdout:new PassThrough(), stderr:new PassThrough() }); child.kill = () => child.emit("exit", 0, "SIGTERM"); return child; } }); const start=a.start.bind(a); a.start=(...x)=>{const w=start(...x);started.push(w);return w;}; a.bindAndPrompt=async()=>({success:true}); return {a,started}; }
 const wait=async(f)=>{for(let i=0;i<100;i++){if(f())return;await new Promise(r=>setTimeout(r,2));}throw new Error("timeout");};
 const report=(c,w,node,outcome)=>w.child.stdout.write(`${JSON.stringify({type:"tool_execution_end",toolName:"orchestrator_report",isError:false,result:{details:{node,generation:c.run.generation,token:w.token,role:w.role,outcome,summary:outcome}}})}\n`);
 

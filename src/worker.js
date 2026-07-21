@@ -34,12 +34,14 @@ export const roleRoute = Object.freeze({
 });
 
 export class WorkerAdapter {
-  constructor({ stateDir, extension = extensionPath, spawnProcess = spawn, requestTimeout = 15000 }) {
+  constructor({ stateDir, extension = extensionPath, spawnProcess = spawn, requestTimeout = 15000, shutdownTimeout = 5000 }) {
     if (!Number.isFinite(requestTimeout) || requestTimeout <= 0) throw new Error("requestTimeout must be positive");
+    if (!Number.isFinite(shutdownTimeout) || shutdownTimeout <= 0) throw new Error("shutdownTimeout must be positive");
     this.stateDir = stateDir;
     this.extension = extension;
     this.spawnProcess = spawnProcess;
     this.requestTimeout = requestTimeout;
+    this.shutdownTimeout = shutdownTimeout;
     this.workers = new Map();
   }
   sessionDir(worker) { return join(this.stateDir, "workers", worker.id); }
@@ -52,8 +54,10 @@ export class WorkerAdapter {
     const route = roleRoute[worker.role];
     if (!route) throw new Error(`unknown worker role: ${worker.role}`);
     mkdirSync(this.sessionDir(worker), { recursive: true, mode: 0o700 }); chmodSync(this.sessionDir(worker), 0o700);
-    const child = this.spawnProcess("pi-pool", this.argv(worker), { cwd: worker.cwd, shell: false, stdio: ["pipe", "pipe", "pipe"] });
-    const record = { ...worker, route, sessionDir: this.sessionDir(worker), child, busy: false, idle: true, reports: [], pending: new Map(), requestSequence: 0, terminated: false };
+    const child = this.spawnProcess("pi-pool", this.argv(worker), { cwd: worker.cwd, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+    let confirmExit;
+    const record = { ...worker, route, sessionDir: this.sessionDir(worker), child, busy: false, idle: true, reports: [], pending: new Map(), requestSequence: 0, terminated: false, exited: false, exitPromise: new Promise((resolve) => { confirmExit = resolve; }) };
+    const exited = (code, signal) => { if (!record.exited) { record.exited = true; confirmExit({ code, signal }); } };
     const rejectPending = (error) => {
       for (const pending of record.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
       record.pending.clear();
@@ -84,7 +88,7 @@ export class WorkerAdapter {
       catch (error) { fail("protocol_error", error); return; }
       fail("protocol_error", new Error("RPC stdout ended"));
     });
-    child.on?.("exit", (code, signal) => fail("process_exit", new Error(`RPC process exited (${code ?? signal ?? "unknown"})`)));
+    child.on?.("exit", (code, signal) => { exited(code, signal); fail("process_exit", new Error(`RPC process exited (${code ?? signal ?? "unknown"})`)); });
     child.on?.("error", (error) => fail("process_error", error));
     child.stderr.on("data", (chunk) => { if (!record.terminated) onEvent?.({ type: "stderr", text: String(chunk) }, record); });
     this.workers.set(record.id, record);
@@ -110,7 +114,24 @@ export class WorkerAdapter {
     if (!bound.success) throw new Error("RPC binding failed");
     return this.command(worker, "prompt", { message: prompt, streamingBehavior: "followUp" });
   }
-  cancel(worker) { try { worker.child.kill("SIGTERM"); } catch {} }
-  shutdown() { for (const worker of this.workers.values()) this.cancel(worker); }
+  terminate(worker) {
+    if (worker.exited) return;
+    try {
+      if (process.platform !== "win32" && Number.isInteger(worker.child.pid) && worker.child.pid > 0) process.kill(-worker.child.pid, "SIGTERM");
+      else worker.child.kill?.("SIGTERM");
+    } catch { try { worker.child.kill?.("SIGTERM"); } catch {} }
+  }
+  async cancel(worker) {
+    if (worker.exited) return;
+    if (worker.shutdownPromise) return worker.shutdownPromise;
+    this.terminate(worker);
+    worker.shutdownPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`worker ${worker.id} did not exit within ${this.shutdownTimeout}ms`)), this.shutdownTimeout);
+      worker.exitPromise.then((value) => { clearTimeout(timer); resolve(value); });
+    });
+    try { return await worker.shutdownPromise; }
+    finally { if (!worker.exited) worker.shutdownPromise = undefined; }
+  }
+  async shutdown() { await Promise.all([...this.workers.values()].map((worker) => this.cancel(worker))); }
   reusable({ runId, role, cwd, policy, stage }) { return [...this.workers.values()].find((worker) => !worker.terminated && !worker.busy && worker.runId === runId && worker.role === role && worker.cwd === cwd && worker.policy === policy && worker.stage === stage); }
 }

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,10 +21,10 @@ class FakeEffects {
   async run(kind) { this.calls.push(kind); if (kind === Effect.COMMIT) return { head: this.current, paths: ["src/x.js"] }; if (kind === Effect.REBASE) { this.current = "head-2"; return { head: this.current }; } if (kind === Effect.RECONCILE_PR) return { existing: null }; if (kind === Effect.PUBLISH_PR) return { pr: "https://pr/1" }; return { checked: 1 }; }
 }
 function workers(dir) {
-  const spawned = []; const adapter = new WorkerAdapter({ stateDir: dir, spawnProcess: () => ({ stdin: { write() {} }, stdout: new PassThrough(), stderr: new PassThrough(), kill() {} }) });
+  const spawned = []; const adapter = new WorkerAdapter({ stateDir: dir, spawnProcess: () => { const child = new EventEmitter(); Object.assign(child, { stdin: { write() {} }, stdout: new PassThrough(), stderr: new PassThrough() }); child.kill = () => child.emit("exit", 0, "SIGTERM"); return child; } });
   const original = adapter.start.bind(adapter); adapter.start = (...args) => { const worker = original(...args); spawned.push(worker); return worker; }; adapter.bindAndPrompt = async () => ({ success: true }); return { adapter, spawned };
 }
-async function ready(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise((r) => setTimeout(r, 2)); } throw new Error("timed out"); }
+async function ready(predicate) { for (let i = 0; i < 500; i++) { if (predicate()) return; await new Promise((r) => setTimeout(r, 2)); } throw new Error("timed out"); }
 function report(ctl, worker, node, outcome, extra = {}) { worker.child.stdout.write(`${JSON.stringify({ type: "tool_execution_end", toolName: "orchestrator_report", isError: false, result: { details: { node, generation: ctl.run.generation, token: worker.token, role: worker.role, outcome, summary: outcome, ...extra } } })}\n`); }
 
 test("valid report followed immediately by settled is serialized and report wins", async () => {

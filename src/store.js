@@ -79,8 +79,8 @@ export class Store {
     finally { await handle.close(); await unlink(file).catch(() => {}); }
   }
   async claimIsActive(owner) {
-    if (!owner?.runId) return true;
-    try { return !terminalClaimOwners.has((await this.load(owner.runId)).status); }
+    if (!owner?.runId) return await this.ownerAlive(owner);
+    try { return !terminalClaimOwners.has((await this.load(owner.runId)).status) || await this.ownerAlive(owner); }
     catch { return await this.ownerAlive(owner); }
   }
   async removeIfOwned(file, runId) {
@@ -129,6 +129,35 @@ export class Store {
       for (const file of this.claimFiles(taskKey, cwd)) await this.removeIfOwned(file, runId);
     });
   }
+  cancelFile(runId) { return join(this.dir, `cancel-${createHash("sha256").update(runId).digest("hex")}.json`); }
+  async requestCancel(runId, reason = "CLI cancel", requestId = randomUUID()) {
+    if (typeof runId !== "string" || !runId || typeof requestId !== "string" || !requestId) throw new Error("runId and requestId are required");
+    if (typeof reason !== "string" || !reason.trim() || reason.length > 500) throw new Error("cancel reason must be 1..500 characters");
+    await this.init(); const file = this.cancelFile(runId); const request = { id: requestId, runId, reason, requestedAt: Date.now() }; let handle;
+    try { handle = await open(file, "wx", 0o600); await handle.writeFile(JSON.stringify(request)); await handle.sync(); await handle.close(); }
+    catch (error) {
+      await handle?.close().catch(() => {});
+      if (handle) await unlink(file).catch(() => {});
+      if (error.code !== "EEXIST") throw error;
+      return this.readCancel(runId);
+    }
+    const directory = await open(this.dir, "r"); try { await directory.sync(); } finally { await directory.close(); }
+    return request;
+  }
+  async readCancel(runId) {
+    try { const request = JSON.parse(await readFile(this.cancelFile(runId), "utf8")); if (request.runId !== runId || typeof request.id !== "string" || !request.id) throw new Error("invalid cancel request"); return request; }
+    catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+  }
+  async consumeCancel(runId, requestId) {
+    const request = await this.readCancel(runId); if (!request || request.id !== requestId) return false;
+    const file = this.cancelFile(runId); const consumed = `${file}.consumed-${createHash("sha256").update(requestId).digest("hex")}`;
+    try { await rename(file, consumed); }
+    catch (error) { if (error.code === "ENOENT") return false; throw error; }
+    const moved = JSON.parse(await readFile(consumed, "utf8"));
+    if (moved.runId !== runId || moved.id !== requestId) throw new Error("cancel request changed while consuming");
+    await unlink(consumed); const directory = await open(this.dir, "r"); try { await directory.sync(); } finally { await directory.close(); }
+    return true;
+  }
   async create(run) {
     await this.init(); const { journal } = files(this.dir, run.id);
     const handle = await open(journal, "wx", 0o600);
@@ -165,7 +194,7 @@ export class Lease {
   async acquire(generation) {
     await privateDir(dirname(this.file)); const token = `${process.pid}:${generation}:${Date.now()}`;
     for (let attempt = 0; attempt < 2; attempt++) {
-      try { const handle = await open(this.file, "wx", 0o600); await handle.writeFile(token); await handle.sync(); await handle.close(); return { token, generation, lease: generation }; }
+      try { const handle = await open(this.file, "wx", 0o600); await handle.writeFile(token); await handle.sync(); await handle.close(); this.token = token; return { token, generation, lease: generation }; }
       catch (error) {
         if (error.code !== "EEXIST" || attempt) throw new Error(`controller lease already held for ${this.file}`);
         const owner = await readFile(this.file, "utf8"); const pid = Number(owner.split(":", 1)[0]);
@@ -177,5 +206,5 @@ export class Lease {
     }
     throw new Error(`controller lease already held for ${this.file}`);
   }
-  async release() { await unlink(this.file).catch(() => {}); }
+  async release() { try { if (this.token && await readFile(this.file, "utf8") === this.token) await unlink(this.file); } catch (error) { if (error.code !== "ENOENT") throw error; } }
 }

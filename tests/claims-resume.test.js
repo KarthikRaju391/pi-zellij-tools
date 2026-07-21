@@ -40,7 +40,7 @@ test("an old owner cannot release claims after a newer run acquires them", async
   for (const file of store.claimFiles("task", "/cwd")) assert.equal(JSON.parse(await readFile(file, "utf8")).runId, "new");
 });
 
-test("waiting-human retains claims while done, cancelled, and failed owners are reclaimable", async () => {
+test("terminal owners stay claimed while live and are reclaimable only after verified release", async () => {
   for (const terminal of ["done", "cancelled", "failed"]) {
     const dir = await mkdtemp(join(tmpdir(), `claims-${terminal}-`)); const store = new Store(dir);
     let run = newRun({ id: `old-${terminal}`, workflow: "investigate-report", spec: taskSpec({ taskKey: `task-${terminal}` }) });
@@ -49,8 +49,8 @@ test("waiting-human retains claims while done, cancelled, and failed owners are 
     await assert.rejects(store.claim(run.taskKey, run.cwd, "blocked"), /active claim/);
     const terminalEvent = terminal === "done" ? ["complete", {}] : terminal === "cancelled" ? ["cancel", {}] : ["reconcile", { target: "x", decision: "abandon" }];
     run = await store.append(run, event(run, terminalEvent[0], terminalEvent[1]));
-    assert.equal(run.status, terminal);
-    await store.claim(run.taskKey, run.cwd, `new-${terminal}`);
+    assert.equal(run.status, terminal); await assert.rejects(store.claim(run.taskKey, run.cwd, `new-${terminal}`), /active claim/);
+    await store.releaseClaim(run.taskKey, run.cwd, run.id); await store.claim(run.taskKey, run.cwd, `new-${terminal}`);
     for (const file of store.claimFiles(run.taskKey, run.cwd)) assert.equal(JSON.parse(await readFile(file, "utf8")).runId, `new-${terminal}`);
   }
 });

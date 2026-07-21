@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +18,7 @@ const ready = async (predicate) => { for (let i = 0; i < 200; i++) { if (predica
 
 function fakeWorkers(dir) {
   const started = [];
-  const adapter = new WorkerAdapter({ stateDir: dir, spawnProcess: () => ({ pid: 4242 + started.length, stdin: { write() {} }, stdout: new PassThrough(), stderr: new PassThrough(), kill() {}, on() {} }) });
+  const adapter = new WorkerAdapter({ stateDir: dir, spawnProcess: () => { const child = new EventEmitter(); Object.assign(child, { pid: 4242 + started.length, stdin: { write() {} }, stdout: new PassThrough(), stderr: new PassThrough() }); child.kill = () => child.emit("exit", 0, "SIGTERM"); return child; } });
   const start = adapter.start.bind(adapter);
   adapter.start = (...args) => { const worker = start(...args); started.push(worker); return worker; };
   adapter.bindAndPrompt = async () => ({ success: true });
